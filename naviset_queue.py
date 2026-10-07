@@ -77,14 +77,22 @@ class CommandQueue:
     def expire(self):
         expired = [r for r in self.rows() if r['expires'] <= self.clock()]
         for row in expired:
-            self.finish(row, 'expired', 'TTL истёк')
+            if row['state'] == 'sent':
+                self.finish(row, 'unknown', 'нет ответа до истечения TTL; выполнение не подтверждено')
+            else:
+                self.finish(row, 'expired', 'TTL истёк до отправки')
         return expired
+
+    def disconnect(self):
+        self.online = False
+        for row in self.rows(('sent',)):
+            self.finish(row, 'unknown', 'связь прервана; выполнение не подтверждено')
 
     def enqueue(self, cmd, payload=b'', ttl=None, delay=0, request_key=None):
         if self.imei is None:
             raise RuntimeError('сначала требуется регистрация платы')
         ttl = TTL.get(cmd, 30) if ttl is None else ttl
-        if not 1 <= ttl <= 255 or delay < 0:
+        if not math.isfinite(ttl) or not math.isfinite(delay) or not 1 <= ttl <= 255 or delay < 0:
             raise ValueError('TTL: 1–255 секунд; задержка неотрицательная')
         if len(payload) > 2037:
             raise ValueError('кадр превышает 2048 байт')
@@ -134,12 +142,22 @@ class CommandQueue:
                 if row['cmd'] == 20:
                     self.finish(row, 'superseded', 'новый запрос блока 13')
             self.flags |= 0x800
+        if cmd == 14 and payload and payload[0] == 0:
+            # Пакеты фото идут потоком со своими uniq. Ответ 11 означает
+            # приём запроса, нулевой пакет 14 — окончание потока.
+            for row in self.rows(('sent',)):
+                if row['cmd'] == 21:
+                    self.finish(row, 'done', 'поток фото завершён')
         for row in self.rows(('sent',)):
             if row['uid'] != uid:
                 continue
             original = row['cmd']
             match = cmd == 11 and len(payload) >= 2 and payload[0] == original
+            if original == 21 and cmd == 11 and len(payload) >= 2 and payload[1] == 0:
+                match = False
             match |= (original, cmd) in {(9, 10), (10, 9), (17, 5), (20, 4), (22, 3)}
+            if original == 21:
+                match |= cmd == 14 and bool(payload) and payload[0] == 0
             if original == 18:
                 index = row['payload'][0] if row['payload'] else -1
                 match |= cmd == 6 and index == 0 or cmd == 15 and payload[0] == index
@@ -182,6 +200,10 @@ class CommandQueue:
             self.db.execute("UPDATE commands SET state='sent',sent=? WHERE id=?", (now, candidate['id']))
             self.db.commit()
             write(candidate['cmd'], bytes(candidate['payload']), candidate['uid'], ttl)
+
+    def history(self, limit=150):
+        return list(self.db.execute('SELECT * FROM commands WHERE imei=? ORDER BY id DESC LIMIT ?',
+                                    (self.imei, limit)))[::-1]
 
     def state(self):
         self.expire()

@@ -1,4 +1,4 @@
-"""Стенд адаптера Нависет. Окно/проверки прежние, обмен — через очереди по IMEI.
+"""Сервер Нависет: диагностика платы, ручное управление, очереди по IMEI.
 
 Запуск: python -X utf8 naviset_server.py [--adapter-profile profile.json]
 Остальные параметры такие же, как у test_server.py. Сеть в тестах — localhost.
@@ -6,6 +6,7 @@
 import argparse
 import datetime
 import json
+import math
 import os
 import queue
 import socket
@@ -35,10 +36,10 @@ def read_profile(path):
         raise ValueError('неизвестные параметры профиля: ' + ', '.join(sorted(unknown)))
     profile = dict(DEFAULTS, **values)
     for key in ('registration_timeout', 'heartbeat_timeout', 'photo_retry', 'photo_stream_timeout'):
-        if not isinstance(profile[key], (int, float)) or profile[key] <= 0:
+        if not isinstance(profile[key], (int, float)) or not math.isfinite(profile[key]) or profile[key] <= 0:
             raise ValueError(f'{key} должен быть положительным числом')
     for key in ('command_delay', 'firmware_delay', 'time_drift_limit'):
-        if not isinstance(profile[key], (int, float)) or profile[key] < 0:
+        if not isinstance(profile[key], (int, float)) or not math.isfinite(profile[key]) or profile[key] < 0:
             raise ValueError(f'{key} должен быть неотрицательным числом')
     for key in ('drop_status_every', 'fragment_size', 'disconnect_after_blocks', 'stop_after_blocks'):
         if not isinstance(profile[key], int) or profile[key] < 0:
@@ -95,6 +96,7 @@ class Board(stand.Board):
 
     def identify(self, imei):
         self.imei = imei
+        self.details = None
         if self.queue is None:
             self.queue = CommandQueue(self.state_dir / f'{imei}.sqlite3')
         self.queue.bind(imei)
@@ -226,7 +228,7 @@ class Board(stand.Board):
                 if self.conn is conn:
                     self.conn = None
                     if self.queue:
-                        self.queue.online = False
+                        self.queue.disconnect()
                 self.lock.notify_all()
 
     def handle(self, uid, cmd, payload):
@@ -481,6 +483,7 @@ class Server(stand.Server):
                 with self.peers_lock:
                     self.sockets.add(conn)
                 worker = threading.Thread(target=self.client, args=(conn,), daemon=True)
+                self.workers = [w for w in self.workers if w.is_alive()]
                 self.workers.append(worker)
                 worker.start()
         except OSError as exc:
@@ -507,7 +510,7 @@ class Server(stand.Server):
         for board in self.boards.values():
             with board.lock:
                 if board.queue:
-                    board.queue.online = False
+                    board.queue.disconnect()
 
 
 class Control(threading.Thread):
@@ -551,6 +554,9 @@ class Control(threading.Thread):
 
     def do(self, line):
         parts = line.split()
+        if parts and parts[0] == 'identity':
+            return [json.dumps(dict(app='domovoi-naviset', port=self.server.port,
+                                   host=self.server.host, state=str(self.server.state_dir.resolve())), ensure_ascii=False)]
         if parts and parts[0] in ('run', 'reload'):
             return ['Этот сервер предназначен для ручной работы с контроллерами.']
         if parts and parts[0] == 'peers':
@@ -586,6 +592,28 @@ class Control(threading.Thread):
         return ['команды: peers | use <IMEI> | state | queue | show | send <cmd> [hex] | enqueue <key> <cmd> <ttl> [hex]']
 
 
+def show_existing(port, host, board_port, state_dir):
+    """Открываем только совместимый экземпляр, а не старый test_server."""
+    if not port:
+        return False
+    def request(command):
+        with socket.create_connection(('127.0.0.1', port), timeout=1) as connection:
+            connection.sendall((command + '\n').encode('utf-8'))
+            with connection.makefile(encoding='utf-8') as stream:
+                return stream.readline(8192).strip()
+    try:
+        identity = json.loads(request('identity'))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(identity, dict) or identity.get('app') != 'domovoi-naviset':
+        return False
+    if (identity.get('port') != board_port or identity.get('host') != host or
+            Path(identity.get('state', '')).resolve() != Path(state_dir).resolve()):
+        raise ValueError('Другой сервер Нависет уже использует порт управления. Проверьте параметры запуска.')
+    request('show')
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--adapter-profile')
@@ -602,6 +630,9 @@ def main():
         stand.LOGS = Path(options.log_dir)
         stand.PHOTOS = stand.LOGS / 'photos'
     stand.LOGS.mkdir(parents=True, exist_ok=True)
+    state_dir = options.adapter_state or stand.LOGS / 'adapter'
+    if show_existing(options.control_port, options.bind, options.port, state_dir):
+        return
     messages = queue.Queue()
     log_lock = threading.Lock()
 
@@ -609,13 +640,19 @@ def main():
         now = datetime.datetime.now().astimezone()
         with log_lock, (stand.LOGS / f'адаптер_{now:%Y-%m-%d}.log').open('a', encoding='utf-8') as stream:
             stream.write(f'{now.isoformat(timespec="milliseconds")} [{kind}] {text}\n')
-        messages.put((kind, text))
         if options.headless:
             print(text, flush=True)
+        else:
+            messages.put((kind, text))
 
     server = Server(options.port, say, options.bind, profile, options.adapter_state)
     # Не показываем старое окно и не выдаём старый сервер за новый режим.
-    control = Control(server, {}, say, lambda: messages.put(('show', '')), options.control_port)
+    try:
+        control = Control(server, {}, say, lambda: messages.put(('show', '')), options.control_port)
+    except OSError:
+        if show_existing(options.control_port, options.bind, options.port, state_dir):
+            return
+        raise
     server.start()
     server.ready.wait(5)
     if server.error or not server.ready.is_set():

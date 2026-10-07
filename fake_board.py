@@ -271,6 +271,11 @@ class FakeBoard:
                 self.answer(cmd, uid, 1)
                 return
             number, off = struct.unpack('<IH', data)
+            if not self.photo:
+                # Повторное итоговое подтверждение пустой очереди допустимо.
+                self.answer(cmd, uid)
+                self.emit(14, bytes(1))
+                return
             if number and number != self.photo_number or off > len(self.photo):
                 self.answer(cmd, uid, 1)
                 return
@@ -282,6 +287,7 @@ class FakeBoard:
             else:
                 for pos in range(off, len(self.photo), 1024):
                     self.emit(14, bytes([1])+struct.pack('<IIH', self.photo_number, len(self.photo), pos)+self.photo[pos:pos+1024])
+                self.emit(14, bytes(1))
         elif cmd == 22:
             self.emit(3, struct.pack('<IBHBIB', self.now(), 23, 250, self.fw, self.build, 0x32)+bytes(8), uid)
         elif cmd == 23:

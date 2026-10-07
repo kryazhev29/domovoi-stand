@@ -1,4 +1,4 @@
-"""Ручная работа оператора с контроллерами. Автотестов в интерфейсе нет."""
+"""Рабочее место для диагностики и ручной работы с контроллерами."""
 import csv
 import datetime as dt
 import json
@@ -16,6 +16,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import test_server as stand
 from naviset_data import id_record, group_record, schedule_record, payloads, integer
+from naviset_dashboard import Dashboard, apply_theme, enable_dpi_awareness
+from naviset_photo import PhotoPreview
 
 
 KINDS = ['1 — Телефон', '2 — RFID 485', '3 — Автономер', '4 — RF433', '5 — Wiegand', '6 — ПИН']
@@ -50,43 +52,63 @@ class App:
         self.server, self.messages, self.say = server, messages, say
         self.store = server.data_store
         self.imei = None
+        enable_dpi_awareness()
         self.root = tk.Tk()
-        self.root.title('ДОМОВОЙ · работа с контроллерами')
-        self.root.geometry('1260x820')
-        self.root.minsize(1060, 720)
-        style = ttk.Style(self.root)
-        style.theme_use('clam')
-        style.configure('TButton', padding=(10, 6))
-        style.configure('Treeview', rowheight=26)
-        style.configure('Title.TLabel', font=('Segoe UI', 17, 'bold'))
-        style.configure('Hint.TLabel', foreground='#526174')
-        self.root.option_add('*Font', ('Segoe UI', 10))
+        self.ui_scale = max(1.0, self.root.winfo_fpixels('1i') / 96)
+        self.root.title('ДОМОВОЙ · Нависет')
+        self.root.geometry(f'{min(round(1180*self.ui_scale), self.root.winfo_screenwidth()-80)}x{min(round(800*self.ui_scale), self.root.winfo_screenheight()-100)}')
+        self.root.minsize(round(960*self.ui_scale), round(640*self.ui_scale))
+        self.style = apply_theme(self.root)
+        self._event_signature = None
+        self._closing = False
+        self._pump_error = None
         head = ttk.Frame(self.root, padding=(16, 12))
         head.pack(fill='x')
-        ttk.Label(head, text='ДОМОВОЙ / Контроллеры', style='Title.TLabel').pack(side='left')
-        ttk.Label(head, text=f'Сервер принимает подключения · порт {server.port}', style='Hint.TLabel').pack(side='right')
-        body = ttk.Panedwindow(self.root, orient='horizontal')
+        ttk.Label(head, text='ДОМОВОЙ', style='Title.TLabel').pack(side='left')
+        ttk.Label(head, text='  /  Нависет', style='Hint.TLabel').pack(side='left', padx=8)
+        self.server_note = tk.StringVar(value=f'●  Сервер запущен · порт {server.port}')
+        ttk.Label(head, textvariable=self.server_note, style='Hint.TLabel').pack(side='right')
+        body = ttk.Frame(self.root)
         body.pack(fill='both', expand=True, padx=12)
-        left = ttk.Frame(body, padding=6)
-        right = ttk.Frame(body, padding=6)
-        body.add(left, weight=1)
-        body.add(right, weight=5)
-        ttk.Label(left, text='Устройства', font=('Segoe UI', 12, 'bold')).pack(anchor='w', pady=6)
-        self.peers = self.tree(left, [('name', 'Название', 145), ('online', 'Связь', 75)], height=17)
+        left = ttk.Frame(body, padding=(14, 16, 14, 6), width=round(235*self.ui_scale), style='Side.TFrame')
+        right = ttk.Frame(body, padding=(18, 6, 6, 6))
+        left.pack(side='left', fill='y')
+        left.pack_propagate(False)
+        right.pack(side='left', fill='both', expand=True)
+        ttk.Label(left, text='ПЛАТЫ', style='Side.TLabel').pack(anchor='w', pady=(4, 8))
+        peer_box = ttk.Frame(left, height=round(125*self.ui_scale))
+        peer_box.pack(fill='x')
+        peer_box.pack_propagate(False)
+        self.peers = self.tree(peer_box, [('name', 'Название / IMEI', 132), ('online', 'Связь', 65)], height=4)
+        self.peers.tag_configure('online', foreground='#16734b')
+        self.peers.tag_configure('offline', foreground='#64748b')
         self.peers.bind('<<TreeviewSelect>>', self.select)
-        ttk.Button(left, text='Добавить / переименовать', command=self.controller_dialog).pack(fill='x', pady=8)
-        ttk.Button(left, text='Сохранить логи в ZIP…', command=self.export_logs).pack(fill='x')
-        ttk.Label(left, text='Сначала выберите контроллер.\nДанные сохраняются на сервере.\nОтправка — отдельной кнопкой.',
-                  style='Hint.TLabel', wraplength=235).pack(anchor='w', pady=16)
-        self.heading = ttk.Label(right, text='Выберите контроллер слева', font=('Segoe UI', 12, 'bold'))
+        ttk.Button(left, text='Добавить / изменить…', style='Side.TButton', command=self.controller_dialog).pack(fill='x', pady=(8, 20))
+        navigation = ttk.Frame(left, style='Side.TFrame')
+        navigation.pack(fill='x')
+        self.heading = ttk.Label(right, text='Выберите контроллер слева', style='Hint.TLabel', wraplength=round(750*self.ui_scale))
         self.heading.pack(anchor='w', pady=(0, 8))
-        self.tabs = ttk.Notebook(right)
+        self.tabs = ttk.Notebook(right, style='Desk.TNotebook')
         self.tabs.pack(fill='both', expand=True)
         self.pages = {}
-        for name in ('Контроллер', 'Доступ', 'Настройки', 'Прошивка', 'Фото и журнал', 'Очередь', 'Обмен'):
-            page = ttk.Frame(self.tabs, padding=12)
-            self.tabs.add(page, text=name)
+        self.page_hosts, self.nav_buttons, self.canvases = {}, {}, {}
+        names = ('Проверка платы', 'Контроллер', 'Доступ', 'Фото и журнал', 'Прошивка', 'Настройки', 'Очередь', 'Обмен')
+        for name in names:
+            host = ttk.Frame(self.tabs)
+            self.tabs.add(host, text=name)
+            self.page_hosts[name] = host
+            if name in ('Проверка платы', 'Контроллер', 'Настройки', 'Прошивка'):
+                page = self.scroll_page(host, name)
+            else:
+                page = ttk.Frame(host, padding=10)
+                page.pack(fill='both', expand=True)
             self.pages[name] = page
+            button = ttk.Button(navigation, text='Управление' if name == 'Контроллер' else name,
+                                style='Nav.TButton', command=lambda n=name: self.navigate(n))
+            button.pack(fill='x', pady=1)
+            self.nav_buttons[name] = button
+        ttk.Button(left, text='Сохранить логи в ZIP…', style='Side.TButton', command=self.export_logs).pack(side='bottom', fill='x', pady=10)
+        self.dashboard = Dashboard(self, self.pages['Проверка платы'])
         self.make_controller()
         self.make_access()
         self.make_settings()
@@ -94,16 +116,51 @@ class App:
         self.make_media()
         self.make_queue()
         self.log = tk.Text(self.pages['Обмен'], wrap='word', state='disabled', font=('Consolas', 10))
-        self.log.pack(fill='both', expand=True)
+        log_scroll = ttk.Scrollbar(self.pages['Обмен'], command=self.log.yview)
+        log_scroll.pack(side='right', fill='y')
+        self.log.configure(yscrollcommand=log_scroll.set, background='#ffffff', foreground='#344054', relief='flat', padx=10, pady=10)
+        self.log.pack(side='left', fill='both', expand=True)
         for tag, color in [('bad', '#b42318'), ('good', '#087443'), ('event', '#6941c6')]:
             self.log.tag_config(tag, foreground=color)
-        self.notice = tk.StringVar(value='Готово. Действия отправляются только выбранному контроллеру.')
-        ttk.Label(self.root, textvariable=self.notice, padding=12, relief='sunken').pack(fill='x')
+        self.notice = tk.StringVar(value='Готово. Подключите плату и нажмите «Проверить плату».')
+        ttk.Label(self.root, textvariable=self.notice, padding=(16, 8), style='Hint.TLabel', wraplength=1050).pack(side='bottom', fill='x', before=body)
         self.root.report_callback_exception = lambda cls, exc, tb: self.error(exc)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
+        self.root.bind_all('<MouseWheel>', self.scroll_wheel, add='+')
+        self.navigate('Проверка платы')
         if minimized:
             self.root.iconify()
         self.pump()
+
+    def navigate(self, name):
+        self.tabs.select(self.page_hosts[name])
+        for key, button in self.nav_buttons.items():
+            button.configure(style='Selected.Nav.TButton' if key == name else 'Nav.TButton')
+
+    def scroll_page(self, host, name):
+        canvas = tk.Canvas(host, highlightthickness=0, background='#f3f6fb')
+        scrollbar = ttk.Scrollbar(host, orient='vertical', command=canvas.yview)
+        scrollbar.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        page = ttk.Frame(canvas, padding=(10, 8, 12, 16))
+        item = canvas.create_window(0, 0, window=page, anchor='nw')
+        page.bind('<Configure>', lambda event: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda event: canvas.itemconfigure(item, width=event.width))
+        self.canvases[str(page)] = canvas
+        return page
+
+    def scroll_wheel(self, event):
+        widget = event.widget
+        if isinstance(widget, (ttk.Treeview, tk.Text, ttk.Combobox, ttk.Spinbox)):
+            return
+        while widget is not None:
+            canvas = self.canvases.get(str(widget))
+            if canvas:
+                if canvas.yview() != (0.0, 1.0):
+                    canvas.yview_scroll(-int(event.delta / 120), 'units')
+                return 'break'
+            widget = getattr(widget, 'master', None)
 
     def tree(self, parent, columns, height=10):
         outer = ttk.Frame(parent)
@@ -111,11 +168,15 @@ class App:
         widget = ttk.Treeview(outer, columns=[c[0] for c in columns], show='headings', height=height)
         for key, title, width in columns:
             widget.heading(key, text=title)
-            widget.column(key, width=width, minwidth=45)
+            widget.column(key, width=round(width*self.ui_scale), minwidth=round(45*self.ui_scale))
         scroll = ttk.Scrollbar(outer, orient='vertical', command=widget.yview)
-        widget.configure(yscrollcommand=scroll.set)
-        scroll.pack(side='right', fill='y')
-        widget.pack(side='left', fill='both', expand=True)
+        horizontal = ttk.Scrollbar(outer, orient='horizontal', command=widget.xview)
+        widget.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        widget.grid(row=0, column=0, sticky='nsew')
+        scroll.grid(row=0, column=1, sticky='ns')
+        horizontal.grid(row=1, column=0, sticky='ew')
         return widget
 
     def entry(self, parent, label, value='', width=30):
@@ -146,8 +207,16 @@ class App:
 
     def command(self, cmd, payload=b'', ttl=None):
         board = self.board()
+        if not board.conn:
+            raise ValueError('Плата не на связи. Подключите её и повторите действие.')
+        if board.check_lock.locked():
+            raise ValueError('Дождитесь завершения проверки платы или остановите её.')
+        if cmd in (2, 5, 8, 11):
+            action = COMMANDS.get(cmd, str(cmd))
+            if not messagebox.askyesno(action, f'{action} · IMEI {self.imei}\nВыполнить на выбранной плате?', parent=self.root):
+                return None
         uid = board.send(cmd, payload, ttl)
-        self.notice.set(f'Команда {cmd} принята в очередь контроллера {self.imei}, №{uid}. Результат — во вкладке «Очередь».')
+        self.notice.set(f'{COMMANDS.get(cmd, "Команда")} · принято в очередь · IMEI {self.imei} · №{uid}. Результат — «Очередь».')
         return uid
 
     def error(self, exc):
@@ -218,7 +287,8 @@ class App:
 
     def send_triggers(self):
         values = bytes([int(v.get()) for v in self.triggers] + [integer(self.call_schedule.get(), 0, 64, 'Расписание звонков')])
-        self.command(5, values + bytes(8))
+        if self.command(5, values + bytes(8)) is None:
+            return
         data = self.store.get(self.imei)
         data['triggers'] = list(values)
         self.store.put(self.imei, data)
@@ -339,6 +409,8 @@ class App:
 
     def synchronize(self, kind):
         board = self.board()
+        if board.check_lock.locked():
+            raise ValueError('Дождитесь окончания проверки платы')
         if kind == 'schedules':
             data = self.store.get(self.imei)
             data.update(scenes=self.scenes.get(), holiday_mode=self.holiday_mode.get())
@@ -413,7 +485,8 @@ class App:
         self.load_data()
 
     def save_settings(self):
-        self.board()
+        if self.board().check_lock.locked():
+            raise ValueError('Дождитесь окончания проверки платы')
         data = self.store.get(self.imei)
         original = bytes.fromhex(data.get('settings', ''))
         if len(original) != 512:
@@ -468,6 +541,8 @@ class App:
         board = self.board()
         if not board.conn or not board.reg:
             raise ValueError('Для начала обновления контроллер должен быть на связи')
+        if board.check_lock.locked() or board.queue.flags & 0x800 or any(r['cmd'] in (19, 20) for r in board.queue.rows()):
+            raise ValueError('Проверка или обновление уже выполняется. Дождитесь завершения.')
         path = Path(self.firmware.get())
         hw = int(path.name.split('.')[0])
         image = stand.Image(path)
@@ -477,6 +552,9 @@ class App:
             raise ValueError('Такая сборка уже установлена')
         if not image.body or len(image.body) > 96 * 1024:
             raise ValueError('Размер приложения должен быть от 1 до 96 КиБ')
+        if not messagebox.askyesno('Обновление прошивки',
+                                  f'IMEI {self.imei}\nУстановить FW {image.fw}, сборку {image.stamp}?\nПлата будет перезапущена.', parent=self.root):
+            return
         with board.lock:
             board.image = image
             board.fw_blocks_sent.clear()
@@ -495,20 +573,38 @@ class App:
 
     def make_media(self):
         page = self.pages['Фото и журнал']
-        self.camera = self.entry(page, 'Адрес камеры', '1')
-        self.camera_compat = tk.BooleanVar(value=False)
-        ttk.Checkbutton(page, text='Формат текущей прошивки: только адрес камеры (по Протокол2 — 7 + адрес)',
-                        variable=self.camera_compat).pack(anchor='w', pady=4)
-        self.buttons(page, [('Сделать фото', self.take_photo),
-                            ('Забрать фото', lambda: self.command(21, bytes(6))),
-                            ('Открыть последнее фото', self.open_photo), ('Забрать журнал', lambda: self.command(9))])
+        ttk.Label(page, text='Камера и события', style='Title.TLabel').pack(anchor='w', pady=(0, 8))
+        camera_row = ttk.Frame(page)
+        camera_row.pack(fill='x')
+        ttk.Label(camera_row, text='Адрес камеры').pack(side='left')
+        self.camera = tk.StringVar(value='1')
+        ttk.Spinbox(camera_row, textvariable=self.camera, from_=1, to=255, width=5).pack(side='left', padx=8)
+        ttk.Button(camera_row, text='Сделать снимок', style='Accent.TButton', command=self.take_photo).pack(side='left', padx=4)
+        ttk.Button(camera_row, text='Получить фото', command=lambda: self.command(21, bytes(6))).pack(side='left', padx=4)
+        ttk.Button(camera_row, text='Оригинал ↗', command=self.open_photo).pack(side='right')
+        compatibility = ttk.Frame(page)
+        compatibility.pack(fill='x', pady=6)
+        ttk.Label(compatibility, text='Формат камеры').pack(side='left', padx=(0, 8))
+        self.camera_format = tk.StringVar(value='ДОМОВОЙ NEXT')
+        ttk.Combobox(compatibility, textvariable=self.camera_format, values=('ДОМОВОЙ NEXT', 'Протокол2'),
+                     state='readonly', width=20).pack(side='left')
+        self.photo_preview = PhotoPreview(page)
+        self.photo_preview.canvas.configure(height=round(270*self.ui_scale))
+        self.photo_preview.pack(fill='both', expand=True, pady=(6, 0))
         self.photo_note = tk.StringVar(value='Фото пока нет')
         ttk.Label(page, textvariable=self.photo_note, style='Hint.TLabel').pack(anchor='w', pady=8)
-        self.events = self.tree(page, [('time', 'Время UTC', 115), ('event', 'Событие', 440)], height=15)
+        event_head = ttk.Frame(page)
+        event_head.pack(fill='x')
+        ttk.Label(event_head, text='Журнал событий', style='Subtitle.TLabel').pack(side='left')
+        ttk.Button(event_head, text='Получить журнал', command=lambda: self.command(9)).pack(side='right', pady=3)
+        self.events = self.tree(page, [('time', 'Время UTC', 115), ('event', 'Событие', 440)], height=4)
 
     def take_photo(self):
         addr = integer(self.camera.get(), 1, 255, 'Адрес камеры')
-        self.command(7, bytes([addr]) if self.camera_compat.get() else bytes([7, addr]))
+        self.command(7, bytes([addr]) if self.camera_format.get() == 'ДОМОВОЙ NEXT' else bytes([7, addr]))
+        data = self.store.get(self.imei)
+        data.update(camera_address=addr, camera_format=self.camera_format.get())
+        self.store.put(self.imei, data)
 
     def open_photo(self):
         board = self.board()
@@ -544,6 +640,8 @@ class App:
         if not self.imei:
             return
         data = self.store.get(self.imei)
+        self.camera.set(str(data.get('camera_address', 1)))
+        self.camera_format.set(data.get('camera_format', 'ДОМОВОЙ NEXT'))
         for kind, tree in self.tables.items():
             tree.delete(*tree.get_children())
             for i, row in enumerate(data.get(kind, [])):
@@ -578,6 +676,8 @@ class App:
             a.set(raw[179+i*2] if len(raw) == 512 else 0)
             t.set(raw[180+i*2] if len(raw) == 512 else 0)
         self.firmware.set(data.get('firmware_file', ''))
+        self.firmware_info.set('Имя файла: HW.FW.номер_сборки.bin')
+        self.firmware_progress.set('Обновление не запускалось для этой платы')
         self.delay.set(str(board.profile['command_delay']))
         self.fw_delay.set(str(board.profile['firmware_delay']))
 
@@ -590,17 +690,22 @@ class App:
             data = self.store.get(imei)
             values = (data.get('name', imei), 'На связи' if imei in boards and boards[imei].conn else 'Нет связи')
             if self.peers.exists(imei):
-                self.peers.item(imei, values=values)
+                self.peers.item(imei, values=values, tags=('online' if imei in boards and boards[imei].conn else 'offline',))
             else:
-                self.peers.insert('', 'end', iid=imei, values=values)
+                self.peers.insert('', 'end', iid=imei, values=values,
+                                  tags=('online' if imei in boards and boards[imei].conn else 'offline',))
         if not self.imei and self.peers.get_children():
-            self.peers.selection_set(self.peers.get_children()[0])
+            online = [imei for imei, board in boards.items() if board.conn]
+            self.peers.selection_set(online[0] if online else self.peers.get_children()[0])
 
     def refresh_board(self):
         if not self.imei:
+            self.dashboard.refresh(None)
+            self.photo_preview.refresh(None, stand.PHOTOS)
             return
         board = self.board()
         data = self.store.get(self.imei)
+        self.photo_preview.refresh(self.imei, stand.PHOTOS)
         self.heading.config(text=f'{data.get("name", self.imei)} · {self.imei} · {data.get("object", "")}')
         with board.lock:
             status, details, reg = board.status, board.details, board.reg
@@ -615,7 +720,8 @@ class App:
             if details:
                 text += f'\nFW {details["firmware"]} · сборка {details["build"]} · сигнал {details["signal"]} · баланс {details["balance"]}'
             self.overview.set(text)
-            rows = board.queue.rows(('queued', 'sent', 'done', 'error', 'expired', 'unknown', 'cancelled', 'superseded')) if board.queue else []
+            self.dashboard.refresh(board)
+            rows = board.queue.history() if board.queue else []
             for row in sorted(rows, key=lambda r: r['id'])[-150:]:
                 key = f'{self.imei}:{row["id"]}'
                 values = (row['uid'], f'{row["cmd"]} · {COMMANDS.get(row["cmd"], "Команда")}', row['priority'], STATES[row['state']], row['reason'])
@@ -627,11 +733,19 @@ class App:
             for key in self.commands.get_children():
                 if key not in keep:
                     self.commands.delete(key)
-            self.events.delete(*self.events.get_children())
-            for record in board.journal[-150:]:
-                self.events.insert('', 'end', values=(stand.when(record.time), str(record)))
-            self.photo_note.set(f'Получено фото в этом сеансе: {len(board.completed_photos)} · последнее смещение: {board.photo_cursor[1]} Б')
-            if board.image:
+            signature = (self.imei, tuple(str(r) for r in board.journal[-150:]))
+            if signature != self._event_signature:
+                position = self.events.yview()[0]
+                self.events.delete(*self.events.get_children())
+                for record in board.journal[-150:]:
+                    self.events.insert('', 'end', values=(stand.when(record.time), str(record)))
+                self.events.yview_moveto(position if self._event_signature and self._event_signature[0] == self.imei else 0)
+                self._event_signature = signature
+            self.photo_note.set(f'Получено фотографий: {len(board.completed_photos)} · ' +
+                                ('Принимаем фото…' if board.busy_photo else 'Ожидание следующего снимка'))
+            if not board.image:
+                self.firmware_progress.set('Обновление не запускалось для этой платы')
+            else:
                 text = f'Отдано блоков: {len(board.fw_blocks_sent)} / {board.image.blocks} · ожидаем сборку {board.image.stamp}'
                 if details and details['build'] == board.image.stamp:
                     confirmed = any(r.type == 136 and r.arg_text().find(str(board.image.stamp)) >= 0 for r in board.journal)
@@ -663,6 +777,19 @@ class App:
         self.notice.set(f'Архив сохранён: {destination}')
 
     def pump(self):
+        try:
+            self.pump_once()
+            self._pump_error = None
+        except Exception as exc:
+            self.notice.set(f'Не удалось обновить экран: {exc}. Повторяем автоматически.')
+            if str(exc) != self._pump_error:
+                self.say(f'ошибка обновления окна: {exc}', 'bad')
+                self._pump_error = str(exc)
+        finally:
+            if not self._closing:
+                self.root.after(700, self.pump)
+
+    def pump_once(self):
         for _ in range(300):
             try:
                 kind, text = self.messages.get_nowait()
@@ -672,18 +799,27 @@ class App:
                 self.root.deiconify()
                 self.root.lift()
                 continue
+            if kind == 'diagnostic':
+                self.dashboard.receive(text)
+                continue
+            follow = self.log.yview()[1] >= .99
             self.log.configure(state='normal')
             self.log.insert('end', f'{dt.datetime.now():%H:%M:%S} {text}\n', kind)
             if int(self.log.index('end-1c').split('.')[0]) > 2000:
                 self.log.delete('1.0', '200.0')
-            self.log.see('end')
+            if follow:
+                self.log.see('end')
             self.log.configure(state='disabled')
         self.refresh_peers()
         self.refresh_board()
-        self.root.after(700, self.pump)
+        self.server_note.set(f'●  Сервер запущен · порт {self.server.port}' if not self.server.error and not self.server.stopping
+                             else 'Сервер остановлен · проверьте обмен')
 
     def close(self):
         if messagebox.askyesno('Закрыть сервер', 'Остановить приём подключений контроллеров?', parent=self.root):
+            self._closing = True
+            for runner in self.dashboard.runners.values():
+                runner.cancel.set()
             self.server.stop()
             self.root.destroy()
 
