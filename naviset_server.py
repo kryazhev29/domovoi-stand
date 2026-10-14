@@ -329,6 +329,13 @@ class Board(stand.Board):
                 self.photo_confirmed = True
                 self.send(21, struct.pack('<IH', *self.photo_last_complete))
             else:
+                if self.photo_confirmed:
+                    # Пустой поток после ACK: старый курсор больше не нужен.
+                    cursor = self.state_dir / 'photos' / self.imei / 'cursor.json'
+                    cursor.unlink(missing_ok=True)
+                    self.photo_cursor = (0, 0)
+                    self.photo_last_complete = None
+                    self.photo_confirmed = False
                 self.busy_photo = False
             return
         if len(payload) < 11:
