@@ -54,13 +54,13 @@ class EndToEnd(unittest.TestCase):
 
     def test_full_protocol(self):
         rows = self.run_case(['full'])
-        self.assertEqual(len(rows), 19)
+        self.assertEqual(len(rows), 18)
 
     def test_outputs(self):
         self.run_case(['выходы'])
 
     def test_reconnect_without_close(self):
-        self.run_case(['связь_после_перезагрузки'], 'reconnect-open')
+        self.run_case(['перезагрузка'], 'reconnect-open')
 
     def test_lost_update_answer(self):
         self.run_case(['обновление', 'журнал'], 'lost11')

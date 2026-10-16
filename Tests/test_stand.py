@@ -81,10 +81,41 @@ class StandTests(unittest.TestCase):
             b.status = (0, flags, 2048, time.perf_counter())
             b.ask = lambda cmd, p=b'', *a, **kw: (2, (1, 11, bytes([cmd, 2])))
             c = srv.Checks(b, lambda *a: None, {})
-            c.output_off = lambda **kw: True
+            c.output_pulse = lambda *a, **kw: True
             ok, text = c.c_выходы()
             self.assertFalse(ok)
             self.assertIn(reason, text)
+
+    def test_output_pulse_needs_on_then_off(self):
+        # Статус «выключен», пришедший до включения реле, не считается концом импульса.
+        b = srv.Board(lambda *a: None)
+        c = srv.Checks(b, lambda *a: None, {})
+        t0 = time.perf_counter()
+        st = lambda f: (time.perf_counter(), 1, 2, srv.struct.pack('<IHH', 0, f, 2048))
+        b.inbox += [st(0), st(2)]
+        self.assertFalse(c.output_pulse(t0, timeout=.2))
+        b.inbox.append(st(0))
+        self.assertTrue(c.output_pulse(t0, timeout=.2))
+
+    def test_settled_waits_status_after_registration(self):
+        b = srv.Board(lambda *a: None)
+        c = srv.Checks(b, lambda *a: None, {})
+        self.assertFalse(c.settled(timeout=5))          # нет регистрации - без ожидания
+        b.reg = {'imei': '1'}
+        b.inbox.append((time.perf_counter(), 1, 2, bytes(8)))
+        b.last_registration = time.perf_counter()
+        self.assertFalse(c.settled(timeout=.2))         # статус был до регистрации
+        b.inbox.append((time.perf_counter(), 2, 2, bytes(8)))
+        self.assertTrue(c.settled(timeout=.2))
+
+    def test_reload_keeps_board(self):
+        server = srv.Server(0, lambda *a: None, '127.0.0.1')
+        board = server.board
+        self.assertEqual(srv.reload_checks(server, lambda *a: None), 'проверки перечитаны')
+        self.assertIs(server.board, board)
+        self.assertIn('перезагрузка', srv.checks.Checks.RISKY)
+        with board.check_lock:
+            self.assertIn('идёт прогон', srv.reload_checks(server, lambda *a: None))
 
     def test_partial_photo_is_not_complete(self):
         with tempfile.TemporaryDirectory() as d:
