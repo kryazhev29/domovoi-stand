@@ -6,6 +6,8 @@ import threading
 import time
 from pathlib import Path
 
+from naviset_queue import answer_code
+
 
 CHECKS = (('connection', 'Связь с платой'), ('status', 'Версия и состояние'),
           ('clock', 'Время платы'), ('crc', 'Чтение CRC структур'))
@@ -53,8 +55,9 @@ class Diagnostics:
                             continue
                         if cmd == response:
                             return data
-                        if cmd == 11 and len(data) >= 2 and data[0] == command and data[1]:
-                            raise ValueError(f'Плата отклонила запрос: код {data[1]}')
+                        code = answer_code(data, command) if cmd == 11 else None
+                        if code:
+                            raise ValueError(f'Плата отклонила запрос: код {code}')
                     left = deadline - time.monotonic()
                     if left <= 0:
                         raise TimeoutError(f'Нет ответа за {self.timeout:g} с. Проверьте связь и очередь')

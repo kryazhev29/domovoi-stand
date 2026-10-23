@@ -70,7 +70,8 @@ class FakeBoard:
         self.sock.sendall(b'SLDN' + body + struct.pack('<H', crc16(body)))
 
     def answer(self, cmd, uid, code=0):
-        self.emit(11, bytes([cmd, code]) + struct.pack('<H', 2048), uid)
+        # Протокол2: код, время, свободный буфер; номера команды в ответе 11 нет (f431b74).
+        self.emit(11, struct.pack('<BIH', code, int(time.time()), 2048), uid)
 
     def event(self, kind, arg=b'', passes=255):
         self.log_index += 1

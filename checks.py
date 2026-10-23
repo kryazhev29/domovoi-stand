@@ -4,7 +4,15 @@ from pathlib import Path
 
 import importlib, protocol
 importlib.reload(protocol)  # reload проверок подхватывает и новые номера событий
-from protocol import EVENTS, Image, crc16, text10
+from protocol import EVENTS, Image, crc16, text10, parse_answer11
+
+
+def stand_answer(p, command):
+    """Код ответа 11 на command или None."""
+    try:
+        return parse_answer11(p, command)[0]
+    except (ValueError, struct.error):
+        return None
 
 LOGS = Path(__file__).resolve().parents[1] / 'Логи'
 OUT1 = 2          # бит выхода 1 в статусе 1
@@ -116,7 +124,11 @@ class Checks:
         не перезапускается, поэтому следующая команда 8 - только после выключения."""
         on = self.b.wait(lambda u, c, p: c == 2 and flags(p) & OUT1, 20, since, stamped=True)
         start = on[0] if on else since
-        return bool(self.b.wait(lambda u, c, p: c == 2 and not flags(p) & OUT1, timeout, start))
+        off = self.b.wait(lambda u, c, p: c == 2 and not flags(p) & OUT1, timeout, start)
+        # Статус «выключен» уходит раньше, чем выход снова примет команду: следующая команда 8
+        # в эту секунду получала 2 «занято» (плата 1, 23.10.2026, обе сборки).
+        time.sleep(1.5)
+        return bool(off)
 
     # --- безопасные ---
     def c_связь(self):
@@ -215,7 +227,7 @@ class Checks:
         allok = True
         for src, ev in ((3, 74), (2, 75), (4, 76), (1, 77)):
             before = self.b.status
-            t0 = time.perf_counter()
+            t0 = sent = time.perf_counter()
             code, reply = self.b.ask(8, bytes([src, 1, 0]))
             ok = code == 0
             if reply:
@@ -227,7 +239,7 @@ class Checks:
                 reason = ('выход занят' if before and before[1] & OUT1 else
                           'реле не разрешено командам сервера: проверьте настройки' if before and t0-before[3] <= 20 else
                           'нет свежего статуса, причина отказа не определена')
-            off = self.output_pulse(t0)
+            off = self.output_pulse(sent)
             allok &= ok and off
             res.append(f'источник {src}: {code}' + (f' ({reason})' if reason else '') +
                        ('' if off else ' — выход не выключился за 60 с'))
@@ -257,10 +269,10 @@ class Checks:
         _, got = self.b.ask(10, b'', 15, want=9)
         return bool(got and got[1] == 9), f'пакет 9: {len(self.b.temp_ids)} ID за сеанс' if got else 'нет пакета 9'
 
-    def c_журнал(self):
+    def sync_events(self):
+        """Конец синхронизации (6-10) плата пишет после 30 с тишины: ждать, пока статус 1 не скажет
+        «в журнале новые записи», а не фиксированную паузу. Перезагрузка раньше теряет эти события."""
         b = self.b
-        # Конец синхронизации (6-10) плата пишет после 30 с тишины: ждать, пока статус 1 не скажет
-        # «в журнале новые записи», а не фиксированную паузу.
         sync = any(e in range(6, 11) for _, e in self.expected)
         end = time.perf_counter() + (45 if sync else 0)
         if sync:
@@ -268,13 +280,26 @@ class Checks:
         while True:
             since = time.perf_counter()
             if not b.pull_journal():
-                return False, b.journal_error
+                return False
             got = b.events_since(self.t0)
-            missing = [(c, e) for c, e in self.expected if e not in got]
+            missing = [(c, e) for c, e in self.expected if e in range(6, 11) and e not in got]
             left = end - time.perf_counter()
             if not missing or left <= 0:
-                break
+                return True
             b.wait(lambda u, c, p: c == 2 and flags(p) & JOURNAL, left, since)
+
+    def journal_idle(self, timeout=60):
+        """Журнал выгружен и статус без бита 12: команда с коротким TTL не ждёт в плате выгрузку."""
+        b = self.b
+        b.pull_journal()
+        return b.until(lambda: not b.busy_journal and b.status and not b.status[1] & JOURNAL, timeout)
+
+    def c_журнал(self):
+        b = self.b
+        if not self.sync_events():
+            return False, b.journal_error
+        got = b.events_since(self.t0)
+        missing = [(c, e) for c, e in self.expected if e not in got]
         if b.journal:
             unknown = sorted({r.type for r in b.journal if r.type not in EVENTS})
         else:
@@ -308,9 +333,17 @@ class Checks:
         now = int(time.time())
         res, ok = [], True
         cfg = self.opts.get('config')
-        if cfg:
+        server1 = self.opts.get('server1', '')
+        if cfg and not server1:
+            ok = False
+            res.append('настройки пропущены: укажите server1=адрес:порт этого сервера, иначе плата уйдёт '
+                       f'на адрес из файла {Path(cfg).name}')
+        elif cfg:
             data = bytearray(Path(cfg).read_bytes()[:512])
             struct.pack_into('<I', data, 0, now)
+            # Сервер 1 — этот сервер: синхронизация настроек не уводит плату на чужой адрес.
+            data[8:40] = server1.encode('ascii')[:31].ljust(32, b'\0')
+            struct.pack_into('<H', data, 510, crc16(bytes(data[:510])))
             code, got = self.b.ask(12, bytes(data), 20, want=12)
             ok &= bool(got and got[1] == 12 and got[2][0] == 4)
             res.append(f'настройки (из {Path(cfg).name}): {"таймштамп" if got and got[1] == 12 else code}')
@@ -435,6 +468,8 @@ class Checks:
 
     def c_перезагрузка(self):
         b = self.b
+        self.sync_events()
+        self.journal_idle()
         s = b.sessions
         t0 = time.perf_counter()
         ok, code = self.answer(2, bytes([0]))
@@ -452,11 +487,13 @@ class Checks:
             return False, 'не выбран файл прошивки'
         b.image = Image(path)
         b.fw_blocks_sent.clear()
+        self.sync_events()
+        self.journal_idle()
         s = b.sessions
         self.expect('обновление', 132, 135, 136)
         t0 = time.perf_counter()
         u = b.send(19, b.image.cmd19())
-        accepted = b.wait(lambda uu, c, p: (uu == u and c == 11 and p[:2] == bytes([19, 0])) or
+        accepted = b.wait(lambda uu, c, p: (uu == u and c == 11 and stand_answer(p, 19) == 0) or
                           (c == 2 and flags(p) & UPDATE), 20, t0)
         if not accepted:
             return False, 'нет успешного ответа 11 или статуса с битом 11; проверьте принятие команды 19'

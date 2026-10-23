@@ -10,6 +10,16 @@ import struct
 import time
 from pathlib import Path
 
+from protocol import parse_answer11
+
+
+def answer_code(payload, command=None):
+    """Код ответа 11 или None, если кадр не ответ на эту команду."""
+    try:
+        return parse_answer11(payload, command)[0]
+    except (ValueError, struct.error):
+        return None
+
 TTL = {2: 30, 3: 30, 5: 30, 6: 5, 7: 5, 8: 5, 9: 30, 10: 30,
        11: 60, 12: 120, 13: 120, 14: 120, 15: 120, 16: 120,
        17: 10, 18: 10, 19: 5, 20: 10, 21: 30, 22: 15, 23: 15,
@@ -133,8 +143,8 @@ class CommandQueue:
         self.expire()
         if cmd == 2:
             _, self.flags, self.free = struct.unpack_from('<IHH', payload)
-        elif cmd == 11 and len(payload) >= 8:
-            self.free = struct.unpack_from('<H', payload, 6)[0]
+        elif cmd == 11 and len(payload) in (7, 8):
+            self.free = struct.unpack_from('<H', payload, len(payload) - 2)[0]
         # Запрос нового/повторного блока заменяет прежний ответ 20. Не ждём
         # потерянного пакета 4: подтверждено перепиской 23.09, 14:43.
         if cmd == 13:
@@ -152,8 +162,10 @@ class CommandQueue:
             if row['uid'] != uid:
                 continue
             original = row['cmd']
-            match = cmd == 11 and len(payload) >= 2 and payload[0] == original
-            if original == 21 and cmd == 11 and len(payload) >= 2 and payload[1] == 0:
+            # Ответ 11 по Протоколу2: код, время, буфер; команда известна по uniq (старый формат с номером тоже).
+            answer = answer_code(payload, original) if cmd == 11 else None
+            match = answer is not None
+            if original == 21 and answer == 0:
                 match = False
             match |= (original, cmd) in {(9, 10), (10, 9), (17, 5), (20, 4), (22, 3)}
             if original == 21:
@@ -164,7 +176,7 @@ class CommandQueue:
             if original in SYNC and cmd == 12 and len(payload) >= 7:
                 match |= payload[0] == SYNC_KIND[original] and payload[1:5] == row['payload'][:4]
             if match:
-                code = payload[1] if cmd in (4, 11) else 0
+                code = answer if cmd == 11 else payload[1] if cmd == 4 else 0
                 self.finish(row, 'done' if code == 0 else 'error', f'ответ {cmd}, код {code}')
 
     def flush(self, write):

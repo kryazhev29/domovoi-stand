@@ -14,9 +14,17 @@ ROOT = Path(__file__).resolve().parents[1]
 LOGS = ROOT / 'Логи'
 PHOTOS = ROOT / 'Фото_с_камеры'
 
-from protocol import ANSWER, EVENTS, Image, Record, crc16, crc_stm, frame, take_frames, text10, when
+from protocol import parse_answer11, ANSWER, EVENTS, Image, Record, crc16, crc_stm, frame, take_frames, text10, when
 import checks
 from checks import Checks          # для Tests/test_stand.py; сервер берёт checks.Checks
+
+
+def answer11_code(payload, command=None):
+    """Код ответа 11 (Протокол2: код, время, буфер; старый формат с номером команды тоже) или None."""
+    try:
+        return parse_answer11(payload, command)[0]
+    except (ValueError, struct.error):
+        return None
 
 
 class Board:
@@ -89,13 +97,13 @@ class Board:
         """Команда и ответ на неё (по uniq): (код ответа 11 или None, пакет)."""
         t0 = time.perf_counter()
         u = self.send(cmd, payload)
-        got = self.wait(lambda uu, c, p: uu == u and c == want and
-                        (c != 11 or len(p) >= 2 and p[0] == cmd), timeout, t0)
+        # Ответ 11 по Протоколу2 (f431b74): код, время, свободный буфер; номера команды нет — только uniq.
+        got = self.wait(lambda uu, c, p: uu == u and c == want and (c != 11 or answer11_code(p, cmd) is not None), timeout, t0)
         if got is None and want != 11:
-            got = self.wait(lambda uu, c, p: uu == u and c == 11 and len(p) >= 2 and p[0] == cmd, 0.1, t0)
+            got = self.wait(lambda uu, c, p: uu == u and c == 11 and answer11_code(p, cmd) is not None, 0.1, t0)
         if got is None:
             return None, None
-        return (got[2][1] if got[1] == 11 else 0), got
+        return (answer11_code(got[2], cmd) if got[1] == 11 else 0), got
 
     # --- приём ---
     def attach(self, conn):
@@ -217,7 +225,8 @@ class Board:
                 self.busy_journal = False
                 self.say(f'журнал выгружен, всего записей за сеанс сервера: {len(self.journal)}')
         elif c == 11:
-            self.say(f'ответ на команду {p[0]}: {ANSWER.get(p[1], p[1])} ({p[1]})', 'good' if p[1] == 0 else 'bad')
+            code = answer11_code(p)
+            self.say(f'ответ 11, uniq {u}: {ANSWER.get(code, code)} ({code})', 'good' if code == 0 else 'bad')
         elif c == 12:
             kind, ts, crc = struct.unpack_from('<BIH', p)
             names = {1: 'ID', 2: 'групп', 3: 'расписаний', 4: 'настроек', 5: 'праздников', 255: 'ОШИБКА'}
@@ -585,6 +594,7 @@ def main():
     ap.add_argument('--wait-board', type=float, default=60)
     ap.add_argument('--firmware')
     ap.add_argument('--config')
+    ap.add_argument('--server1', help='адрес:порт этого сервера для синхронизации настроек')
     ap.add_argument('--phone', default='')
     ap.add_argument('--camera', default=1, type=int)
     ap.add_argument('--output', '-o')

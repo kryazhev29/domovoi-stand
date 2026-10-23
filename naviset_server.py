@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 import test_server as stand
-from naviset_queue import CommandQueue, SYNC_KIND
+from naviset_queue import CommandQueue, SYNC_KIND, answer_code
 from naviset_data import DataStore
 
 
@@ -26,7 +26,7 @@ DEFAULTS = dict(registration_timeout=5.0, heartbeat_timeout=30.0,
                 drop_status_every=0, fragment_size=0, corrupt_block=-1,
                 disconnect_after_blocks=0, stop_after_blocks=0,
                 time_drift_limit=300, photo_retry=3.0, photo_stream_timeout=30.0,
-                allowed_imeis=[], structures={})
+                allowed_imeis=[], structures={}, factory_on_default=True)
 
 
 def read_profile(path):
@@ -101,6 +101,7 @@ class Board(stand.Board):
             self.queue = CommandQueue(self.state_dir / f'{imei}.sqlite3')
         self.queue.bind(imei)
         self.sync_plan.clear()
+        self.factory_sent = False
         self.journal = [stand.Record(r[0]) for r in self.queue.db.execute(
             'SELECT raw FROM journal WHERE imei=? ORDER BY rowid DESC LIMIT 1500', (imei,))][::-1]
         self.last_status = time.monotonic()
@@ -252,10 +253,13 @@ class Board(stand.Board):
             return
         if self.queue is None or self.reg is None:
             raise ConnectionError('пакет до регистрации')
+        # Ответ 11 не несёт номера команды: исходная команда — по uniq отправленной строки очереди.
+        original = next((r['cmd'] for r in self.queue.rows(('sent',)) if r['uid'] == uid), None)
+        answer = answer_code(payload, original) if cmd == 11 else None
         self.queue.observe(uid, cmd, payload)
-        if cmd == 11 and payload[0] in SYNC_KIND and payload[1]:
+        if answer and original in SYNC_KIND:
             self.sync_plan.clear()
-            self.say(f'[{self.imei}] синхронизация остановлена: отказ команды {payload[0]}', 'bad')
+            self.say(f'[{self.imei}] синхронизация остановлена: отказ команды {original}, код {answer}', 'bad')
         if cmd == 3:
             values = struct.unpack_from('<IBHBIB', payload)
             self.details = dict(time=values[0], signal=values[1], balance=values[2], firmware=values[3],
@@ -273,6 +277,12 @@ class Board(stand.Board):
             if abs(time.time() - bt) > self.profile['time_drift_limit']:
                 if not any(r['cmd'] == 23 for r in self.queue.rows()):
                     self.send(23, struct.pack('<I', int(time.time())))
+            if (flags & 0x8000 and self.profile['factory_on_default'] and not self.factory_sent and
+                    not any(r['cmd'] == 3 for r in self.queue.rows())):
+                # Как у сервера NAVISET: контроллер в заводском состоянии обнуляется командой 3 перед синхронизацией.
+                self.factory_sent = True
+                self.say(f'[{self.imei}] бит 15 (заводские настройки): команда 3', 'head')
+                self.send(3, bytes([0]))
             if not flags & 0x800:
                 for flag, command, busy in ((0x1000, 9, 'busy_journal'), (0x4000, 10, 'busy_ids')):
                     if self.auto_journal and flags & flag and not getattr(self, busy):
@@ -309,8 +319,8 @@ class Board(stand.Board):
             else:
                 self.busy_journal = False
             return
-        if cmd == 11 and payload[0] == 21 and payload[1] in (1, 2):
-            if payload[1] == 1:
+        if original == 21 and answer in (1, 2):
+            if answer == 1:
                 self.photo_cursor = (0, 0)
                 self.photo_last_complete = None
             self.deferred_photo = (time.monotonic() + self.profile['photo_retry'],
@@ -525,7 +535,7 @@ class Control(threading.Thread):
 
     def __init__(self, server, opts, say, show=None, port=15011):
         super().__init__()
-        self.server, self.say, self.show = server, say, show
+        self.server, self.opts, self.say, self.show = server, opts, say, show
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_EXCLUSIVEADDRUSE', socket.SO_REUSEADDR), 1)
         try:
@@ -564,8 +574,19 @@ class Control(threading.Thread):
         if parts and parts[0] == 'identity':
             return [json.dumps(dict(app='domovoi-naviset', port=self.server.port,
                                    host=self.server.host, state=str(self.server.state_dir.resolve())), ensure_ascii=False)]
-        if parts and parts[0] in ('run', 'reload'):
-            return ['Этот сервер предназначен для ручной работы с контроллерами.']
+        if parts and parts[0] == 'run':
+            # Проверки протокола (checks.py) на выбранной плате: один сервер и для ручной работы, и для прогонов.
+            for kv in [w for w in parts[1:] if '=' in w]:
+                key, value = kv.split('=', 1)
+                self.opts[key] = value
+            self.opts.setdefault('log_dir', str(stand.LOGS))
+            names = [w for w in parts[1:] if '=' not in w]
+            C = stand.checks.Checks
+            names = C.SAFE + C.RISKY if names == ['full'] else C.SAFE if names in (['all'], []) else names
+            return [f'{"ГОДНО" if ok else "НЕ ГОДНО"} {n}: {t}'
+                    for n, ok, t in stand.checks.Checks(self.server.board, self.say, self.opts).run(names)]
+        if parts and parts[0] == 'reload':
+            return [stand.reload_checks(self.server, self.say)]
         if parts and parts[0] == 'peers':
             with self.server.peers_lock:
                 return [f'{imei}: online={bool(b.conn)}, sessions={b.sessions}'
@@ -592,11 +613,18 @@ class Control(threading.Thread):
                              ttl=int(parts[3]), request_key=parts[1])
             return [f'в очереди: uniq={uid}']
         if parts and parts[0] == 'state':
-            return [f'режим: Нависет; IMEI {board.imei}; связь: {bool(board.conn)}; очередь: ctl.py queue']
+            st = board.status
+            return [f'режим: Нависет; IMEI {board.imei}; подключена: {bool(board.conn)}, сеансов {board.sessions}',
+                    f'статус: {st and hex(st[1])} ({st and stand.Board.flags_text(st[1])}), записей журнала {len(board.journal)}; очередь: ctl.py queue']
         if parts and parts[0] == 'send':
             uid = board.send(int(parts[1]), bytes.fromhex(''.join(parts[2:])))
             return [f'в очереди: uniq={uid}']
-        return ['команды: peers | use <IMEI> | state | queue | show | send <cmd> [hex] | enqueue <key> <cmd> <ttl> [hex]']
+        if parts and parts[0] == 'journal':
+            board.pull_journal()
+            return [str(r) for r in board.journal[-int(parts[1]) if len(parts) > 1 else -50:]]
+        return ['команды: peers | use <IMEI> | state | queue | show | send <cmd> [hex] | enqueue <key> <cmd> <ttl> [hex] | '
+                'journal [n] | run all | run full | run <проверки> [config=файл] [firmware=файл] [phone=79..] | reload',
+                'проверки: ' + ' '.join(stand.checks.Checks.SAFE + stand.checks.Checks.RISKY + stand.checks.Checks.HEAVY)]
 
 
 def show_existing(port, host, board_port, state_dir):

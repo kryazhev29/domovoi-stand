@@ -27,7 +27,7 @@ class EndToEnd(unittest.TestCase):
             command = [sys.executable, '-B', '-X', 'utf8', str(ROOT/'test_server.py'),
                        '--headless', '--bind', '127.0.0.1', '--port', str(port),
                        '--run', *checks, '--firmware', str(image), '--phone', '9990000000',
-                       '--config', str(config),
+                       '--config', str(config), '--server1', f'127.0.0.1:{port}',
                        '--wait-board', '10', '--log-dir', d, '--json', str(result),
                        '--update-timeout', '3']
             with (folder/'server.log').open('w', encoding='utf-8') as log:
