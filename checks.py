@@ -158,7 +158,9 @@ class Checks:
         if not ok:
             return False, f'ответ {code}'
         t0 = time.perf_counter()
-        got = b.wait(lambda u, c, p: c == 2, 20, t0)
+        # Период статуса 15 с отсчитывается по часам платы: после установки времени статус
+        # пришёл через 20,5 с (плата №1, 23.10.2026). Ждём до предела сеанса 30 с.
+        got = b.wait(lambda u, c, p: c == 2, 30, t0)
         if not got:
             return False, 'после команды 23 нет статуса'
         diff = struct.unpack_from('<I', got[2])[0] - int(time.time())
