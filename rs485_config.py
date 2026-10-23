@@ -143,7 +143,7 @@ class Settings485:
         except (ValueError, AttributeError):
             return
         types = [values[180+i*2] for i in range(8)]
-        self.note.config(text='JPEG-камера C328 должна быть на шине одна' if 3 in types and sum(t != 0 for t in types) > 1 else '')
+        self.note.config(text='JPEG-камера C328 должна быть на шине одна' if 2 in types and sum(t != 0 for t in types) > 1 else '')
         for i in range(8):
             self.fields[179+i*2].config(state='normal' if values[172] else 'disabled')
             self.fields[180+i*2].config(state='readonly' if values[172] else 'disabled')
