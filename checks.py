@@ -5,6 +5,7 @@ from pathlib import Path
 import importlib, protocol
 importlib.reload(protocol)  # reload проверок подхватывает и новые номера событий
 from protocol import EVENTS, Image, crc16, text10, parse_answer11
+STATUS2_NET = {0: 'нет', 1: '2G', 2: '3G', 3: 'LTE', 4: 'Wi-Fi'}  # тип сети в статусе 2 (Протокол2 27.10.2026)
 
 
 def stand_answer(p, command):
@@ -167,6 +168,7 @@ class Checks:
         return abs(diff) <= 3, f'время платы отличается на {diff} с'
 
     def c_статус2(self):
+        # Протокол2 27.10.2026: после периферии входы/выходы 4 Б, оператор 1 Б, тип сети 1 Б.
         for _ in range(4):
             code, got = self.b.ask(22, b'', 15, want=3)
             if not got or got[1] != 3:
@@ -177,13 +179,19 @@ class Checks:
             # 99 - модем после старта ещё не измерил сигнал: спросить снова после следующего статуса 1.
             self.b.wait(lambda u, c, p: c == 2, 20)
         bad = []
-        if len(got[2]) != 21:
-            bad.append(f'длина {len(got[2])}, а не 21')
+        if len(got[2]) != 27:
+            bad.append(f'длина {len(got[2])}, а не 27')
+        extra = ''
+        if len(got[2]) >= 27:
+            i1, i2, o1, o2, oper, net = got[2][21:27]
+            extra = f', входы {i1}/{i2}, выходы {o1}/{o2}, оператор {oper}, сеть {STATUS2_NET.get(net, net)}'
+            if net == 0 and csq != 99:
+                bad.append('тип сети не определён при наличии сигнала')
         if boot != 0x32:
             bad.append(f'загрузчик {boot:#x}')
         if not 0 < csq < 32:
             bad.append(f'сигнал {csq}')
-        return not bad, f'FW {fw}, сборка {build}, сигнал {csq}, баланс {bal}' + (f'; {"; ".join(bad)}' if bad else '')
+        return not bad, f'FW {fw}, сборка {build}, сигнал {csq}, баланс {bal}{extra}' + (f'; {"; ".join(bad)}' if bad else '')
 
     def c_crc(self):
         code, got = self.b.ask(17, b'', 15, want=5)

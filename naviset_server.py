@@ -264,6 +264,9 @@ class Board(stand.Board):
             values = struct.unpack_from('<IBHBIB', payload)
             self.details = dict(time=values[0], signal=values[1], balance=values[2], firmware=values[3],
                                 build=values[4], boot=values[5], peripherals=payload[13:21].hex(' '))
+            if len(payload) >= 27:  # Протокол2 27.10.2026: входы/выходы, оператор, тип сети
+                self.details.update(inputs=list(payload[21:23]), outputs=list(payload[23:25]),
+                                    operator=payload[25], net=payload[26])
         if cmd == 2:
             bt, flags, free = struct.unpack_from('<IHH', payload)
             self.last_status = time.monotonic()

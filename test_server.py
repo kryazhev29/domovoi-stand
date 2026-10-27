@@ -188,7 +188,8 @@ class Board:
         elif c == 3:
             bt, csq, bal, fw, build, boot = struct.unpack_from('<IBHBIB', p)
             self.say(f'статус 2: время {when(bt)}, сигнал {csq}, баланс {bal}, FW {fw} сборка {build}, '
-                     f'загрузчик {boot:#x}, периферия {p[13:21].hex(" ")}')
+                     f'загрузчик {boot:#x}, периферия {p[13:21].hex(" ")}'
+                     + (f', входы {p[21]}/{p[22]}, выходы {p[23]}/{p[24]}, оператор {p[25]}, сеть {p[26]}' if len(p) >= 27 else ''))
         elif c == 4:
             self.say(f'обновление: {p[0]}%, код {p[1]}' + (' - ЗАГРУЗКА ПРЕКРАЩЕНА' if p[1] == 253 else ''),
                      'bad' if p[1] == 253 else 'info')
