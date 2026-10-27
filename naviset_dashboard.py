@@ -1,4 +1,6 @@
 """Главный экран: подключение, безопасная диагностика и результаты по IMEI."""
+import http.client
+import ipaddress
 import os
 import json
 import socket
@@ -75,18 +77,40 @@ def apply_theme(root):
 
 
 def local_addresses():
-    """IPv4 этого компьютера для поля «сервер 1» платы: адрес основного выхода в сеть, без виртуальных адаптеров."""
+    """IPv4 этого компьютера, домашняя сеть первой: 192.168.*, 10.*, 172.16–31.*, остальные."""
+    found = set()
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-            probe.connect(('8.8.8.8', 53))  # UDP, ничего не отправляется — только выбор интерфейса
-            return [probe.getsockname()[0]]
+        found.update(socket.gethostbyname_ex(socket.gethostname())[2])
     except OSError:
         pass
     try:
-        found = socket.gethostbyname_ex(socket.gethostname())[2]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('8.8.8.8', 53))  # UDP, ничего не отправляется — только выбор интерфейса
+            found.add(probe.getsockname()[0])
     except OSError:
-        found = []
-    return [a for a in found if not a.startswith('127.')] or ['адрес не определён']
+        pass
+    usable = [a for a in found if not a.startswith(('127.', '169.254.'))]
+    rank = lambda a: (0 if a.startswith('192.168.') else 1 if a.startswith('10.') else
+                      2 if ipaddress.ip_address(a).is_private else 3, a)
+    return sorted(usable, key=rank)
+
+
+def external_address():
+    """Внешний адрес места, куда плата придёт из GSM: (внешний, внутренний этого ПК) или (None, внутренний).
+    Запрос идёт с каждого внутреннего адреса по очереди: через VPN сайт увидит адрес VPN, а не роутера."""
+    local = local_addresses()
+    for source in local:
+        for host in ('api.ipify.org', 'ifconfig.me', 'icanhazip.com'):
+            try:
+                connection = http.client.HTTPSConnection(host, timeout=5, source_address=(source, 0))
+                connection.request('GET', '/', headers={'User-Agent': 'curl/8'})
+                answer = connection.getresponse().read(64).decode('ascii', 'replace').strip()
+                connection.close()
+                if ipaddress.ip_address(answer).version == 4 and ipaddress.ip_address(answer).is_global:
+                    return answer, source
+            except (OSError, ValueError, http.client.HTTPException):
+                continue
+    return None, local[0] if local else None
 
 
 class Dashboard:
@@ -111,6 +135,21 @@ class Dashboard:
             note = ttk.Label(box, text='Ожидание платы', style='Card.TLabel', foreground='#64748b', wraplength=int(185*app.ui_scale))
             note.pack(anchor='w')
             self.cards[key] = value, note
+        place = ttk.Frame(parent, style='Card.TFrame', padding=14)
+        place.pack(fill='x', pady=(8, 0))
+        ttk.Label(place, text='АДРЕС СЕРВЕРА ДЛЯ ПЛАТЫ (СЕРВЕР 1)', style='Card.TLabel').pack(anchor='w')
+        line = ttk.Frame(place, style='PlainCard.TFrame')
+        line.pack(fill='x', pady=(8, 6))
+        self.address = tk.StringVar(value='определяем…')
+        # Поле только для чтения: адрес можно выделить и скопировать руками.
+        ttk.Entry(line, textvariable=self.address, state='readonly', font=('Segoe UI', 15, 'bold'), width=24).pack(side='left')
+        self.copy_button = ttk.Button(line, text='Копировать', command=self.copy_address, state='disabled')
+        self.copy_button.pack(side='left', padx=8)
+        self.address_note = tk.StringVar(value='Определяем внешний адрес этого места в интернете…')
+        ttk.Label(place, textvariable=self.address_note, style='Card.TLabel', foreground='#475569',
+                  justify='left', wraplength=int(680*app.ui_scale)).pack(anchor='w')
+        self.place, self.address_shown = None, False  # (внешний, внутренний) из фонового потока; окно читает его в refresh
+        threading.Thread(target=lambda: setattr(self, 'place', external_address()), daemon=True).start()
         self.connection_note = tk.StringVar(value='Подключённая плата появится слева автоматически.')
         ttk.Label(parent, textvariable=self.connection_note, style='Hint.TLabel', wraplength=int(680*app.ui_scale)).pack(anchor='w', pady=12)
         action = ttk.Frame(parent)
@@ -199,15 +238,44 @@ class Dashboard:
         signal = details['signal'] if details else None
         value.configure(text=f'{signal} / 31' if signal is not None and 0 <= signal <= 31 else '—')
         note.configure(text='По последнему запросу статуса' if details else 'Прочитаем при проверке')
+        self.show_address()
         self.connection_note.set(f'IMEI {imei} · сеанс {board.sessions}' if online else
-                                 f'Сервер слушает порт {self.app.server.port}, адрес этого компьютера: {", ".join(local_addresses())}. '
-                                 'Впишите адрес и порт в плату как сервер 1 (NextConfig → Сервис); плата появится в списке слева.')
+                                 'Ждём плату. Как только она подключится по адресу выше, появится в списке слева.')
         busy = imei in self.runners
         self.start_button.configure(state='normal' if fresh and not busy else 'disabled')
         self.stop_button.configure(state='normal' if busy else 'disabled')
         record = self.reports.get(imei, {})
         if record.get('finished') and board and (not online or record.get('previous') or record.get('session') != board.sessions) and not busy:
             self.summary.set('Результат прошлого подключения · повторите проверку')
+
+    def show_address(self):
+        port = self.app.server.port
+        if self.place is None or self.address_shown:
+            return
+        external, local = self.place
+        here = f'внутренний адрес этого компьютера {local}' if local else 'внутренний адрес этого компьютера'
+        if external:
+            self.address.set(f'{external}:{port}')
+            self.copy_button.configure(state='normal')
+            self.address_note.set(
+                f'Это внешний (глобальный) адрес этого места в интернете. Впишите его плате как сервер 1: '
+                f'в NextConfig по USB (Сервис → сервер 1) или командой 12 со своего сервера.\n'
+                f'Плата выходит в интернет через GSM и видит только внешний адрес. Поэтому на роутере '
+                f'нужно пробросить TCP-порт {port} на {here}. Если у компьютера внешний адрес без роутера, проброс не нужен.\n'
+                f'Адрес вида 192.168.… или 10.… плате не подходит: он работает только внутри вашей сети.')
+        else:
+            self.address.set('не определён')
+            self.address_note.set(
+                f'Не удалось узнать внешний адрес: нет интернета или сайты определения адреса недоступны. '
+                f'Узнайте его в настройках роутера (WAN / Интернет) или у провайдера и впишите плате как сервер 1 с портом {port}.\n'
+                f'На роутере пробросьте TCP-порт {port} на {here}. Адрес вида 192.168.… или 10.… плате не подходит.')
+        self.address_shown = True  # показано один раз; дальше не перерисовываем
+
+    def copy_address(self):
+        root = self.app.root
+        root.clipboard_clear()
+        root.clipboard_append(self.address.get())
+        self.app.notice.set(f'Скопировано: {self.address.get()}')
 
     def start(self):
         board = self.app.board()
