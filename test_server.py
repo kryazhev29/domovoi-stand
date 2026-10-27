@@ -10,7 +10,8 @@ journal [n] | state | reload (перечитать checks.py, связь с пл
 import argparse, datetime, importlib, queue, socket, struct, sys, threading, time, json
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# В exe (PyInstaller) __file__ лежит во временной папке: логи и фото кладём рядом с exe.
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parents[1]
 LOGS = ROOT / 'Логи'
 PHOTOS = ROOT / 'Фото_с_камеры'
 

@@ -107,7 +107,8 @@ class App:
                                 style='Nav.TButton', command=lambda n=name: self.navigate(n))
             button.pack(fill='x', pady=1)
             self.nav_buttons[name] = button
-        ttk.Button(left, text='Сохранить логи в ZIP…', style='Side.TButton', command=self.export_logs).pack(side='bottom', fill='x', pady=10)
+        ttk.Button(left, text='Сохранить логи в ZIP…', style='Side.TButton', command=self.export_logs).pack(side='bottom', fill='x', pady=(4, 10))
+        ttk.Button(left, text='Открыть папку логов', style='Side.TButton', command=lambda: os.startfile(stand.LOGS)).pack(side='bottom', fill='x')
         self.dashboard = Dashboard(self, self.pages['Проверка платы'])
         self.make_controller()
         self.make_access()
@@ -753,28 +754,44 @@ class App:
                 self.firmware_progress.set(text)
 
     def export_logs(self):
-        board = self.board()
-        destination = filedialog.asksaveasfilename(parent=self.root, defaultextension='.zip',
-                                                  initialfile=f'domovoi_{self.imei}_{dt.datetime.now():%Y%m%d_%H%M%S}.zip')
+        """Всё для разработчика сервера: кадры обмена, журнал сервера, отчёты, очередь и фото.
+        Плата выбрана — только её файлы, не выбрана — все платы."""
+        imei = self.imei or '*'
+        desktop = Path.home() / 'Desktop'
+        destination = filedialog.asksaveasfilename(parent=self.root, defaultextension='.zip', filetypes=[('Архив ZIP', '*.zip')],
+                                                  initialdir=desktop if desktop.is_dir() else Path.home(),
+                                                  initialfile=f'domovoi_{self.imei or "все"}_{dt.datetime.now():%Y%m%d_%H%M%S}.zip')
         if not destination:
             return
-        with tempfile.TemporaryDirectory(prefix='domovoi-logs-') as temporary:
-            snapshot = Path(temporary) / 'queue.sqlite3'
-            target = sqlite3.connect(snapshot)
-            try:
-                with board.lock:
-                    board.queue.db.backup(target)
-            finally:
-                target.close()
-            with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:
-                archive.write(snapshot, 'queue.sqlite3')
-                archive.writestr('controller.json', json.dumps(self.store.get(self.imei), ensure_ascii=False, indent=2))
-                archive.writestr('profile.json', json.dumps(board.profile, ensure_ascii=False, indent=2))
-                for path in (self.server.state_dir / 'traffic').glob(f'{self.imei}_*.jsonl'):
-                    archive.write(path, 'traffic/' + path.name)
-                for path in stand.PHOTOS.glob(f'{self.imei}_*.jpg'):
-                    archive.write(path, 'photos/' + path.name)
-        self.notice.set(f'Архив сохранён: {destination}')
+        count = 0
+        with tempfile.TemporaryDirectory(prefix='domovoi-logs-') as temporary, \
+                zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:
+            with self.server.peers_lock:
+                boards = [b for b in self.server.boards.values() if b.queue and (imei == '*' or b.imei == imei)]
+            for board in boards:  # открытые базы очередей — через backup, иначе снимок может быть неполным
+                snapshot = Path(temporary) / f'{board.imei}.sqlite3'
+                target = sqlite3.connect(snapshot)
+                try:
+                    with board.lock:
+                        board.queue.db.backup(target)
+                finally:
+                    target.close()
+                archive.write(snapshot, f'queue/{board.imei}.sqlite3')
+                archive.writestr(f'queue/{board.imei}_profile.json', json.dumps(board.profile, ensure_ascii=False, indent=2))
+                archive.writestr(f'queue/{board.imei}_controller.json', json.dumps(self.store.get(board.imei), ensure_ascii=False, indent=2))
+                count += 1
+            for folder, pattern, name in ((self.server.state_dir / 'traffic', f'{imei}_*.jsonl', 'traffic'),
+                                          (self.server.state_dir / 'reports', f'проверка_{imei}_*.*', 'reports'),
+                                          (stand.PHOTOS, f'{imei}_*.jpg', 'photos'),
+                                          (stand.LOGS, 'адаптер_*.log', 'server')):
+                for path in sorted(folder.glob(pattern)) if folder.is_dir() else []:
+                    archive.write(path, f'{name}/{path.name}')
+                    count += 1
+            archive.writestr('ЧТО_ВНУТРИ.txt', 'traffic — каждый кадр обмена с платой в обе стороны (JSON Lines: время UTC, направление, hex, '
+                             'команда, расшифровка).\nserver — журнал сервера по дням (то же, что вкладка «Обмен»).\n'
+                             'reports — отчёты «Проверка платы».\nqueue — очередь команд и журнал событий платы (SQLite), профиль, карточка.\n'
+                             'photos — снимки с камеры.\n')
+        self.notice.set(f'Архив сохранён, файлов: {count} — {destination}')
 
     def pump(self):
         try:

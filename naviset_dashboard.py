@@ -1,6 +1,7 @@
 """Главный экран: подключение, безопасная диагностика и результаты по IMEI."""
 import os
 import json
+import socket
 import threading
 import time
 import tkinter as tk
@@ -71,6 +72,21 @@ def apply_theme(root):
     style.map('TNotebook.Tab', background=[('selected', 'white'), ('active', '#dce8fa')],
               foreground=[('selected', '#1747a6')])
     return style
+
+
+def local_addresses():
+    """IPv4 этого компьютера для поля «сервер 1» платы: адрес основного выхода в сеть, без виртуальных адаптеров."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('8.8.8.8', 53))  # UDP, ничего не отправляется — только выбор интерфейса
+            return [probe.getsockname()[0]]
+    except OSError:
+        pass
+    try:
+        found = socket.gethostbyname_ex(socket.gethostname())[2]
+    except OSError:
+        found = []
+    return [a for a in found if not a.startswith('127.')] or ['адрес не определён']
 
 
 class Dashboard:
@@ -184,7 +200,8 @@ class Dashboard:
         value.configure(text=f'{signal} / 31' if signal is not None and 0 <= signal <= 31 else '—')
         note.configure(text='По последнему запросу статуса' if details else 'Прочитаем при проверке')
         self.connection_note.set(f'IMEI {imei} · сеанс {board.sessions}' if online else
-                                 f'Сервер слушает порт {self.app.server.port}. Подключите плату к этому компьютеру; она появится в списке слева.')
+                                 f'Сервер слушает порт {self.app.server.port}, адрес этого компьютера: {", ".join(local_addresses())}. '
+                                 'Впишите адрес и порт в плату как сервер 1 (NextConfig → Сервис); плата появится в списке слева.')
         busy = imei in self.runners
         self.start_button.configure(state='normal' if fresh and not busy else 'disabled')
         self.stop_button.configure(state='normal' if busy else 'disabled')

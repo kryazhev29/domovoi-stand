@@ -663,6 +663,8 @@ def main():
     parser.add_argument('--log-dir')
     parser.add_argument('--control-port', type=int, default=15011)
     options = parser.parse_args()
+    if options.headless and sys.stdout:  # консоль cp1251 не должна ронять разбор кадра из-за стрелки в тексте
+        sys.stdout.reconfigure(errors='replace')
     profile = read_profile(options.adapter_profile)
     if options.log_dir:
         stand.LOGS = Path(options.log_dir)

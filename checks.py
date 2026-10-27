@@ -1,5 +1,5 @@
 """Проверки протокола для тестового сервера. Перечитываются на ходу (команда reload), связь с платой не рвётся."""
-import datetime, json, struct, time
+import datetime, json, struct, sys, time
 from pathlib import Path
 
 import importlib, protocol
@@ -15,7 +15,7 @@ def stand_answer(p, command):
     except (ValueError, struct.error):
         return None
 
-LOGS = Path(__file__).resolve().parents[1] / 'Логи'
+LOGS = (Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parents[1]) / 'Логи'
 OUT1 = 2          # бит выхода 1 в статусе 1
 UPDATE = 0x800    # бит 11: идёт обновление
 JOURNAL = 0x1000  # бит 12: в журнале есть новые записи
