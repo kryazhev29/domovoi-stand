@@ -21,11 +21,23 @@ def date_seconds(value):
     return int(dt.datetime.strptime(value, '%Y-%m-%d').replace(tzinfo=dt.timezone.utc).timestamp()) if value else 0
 
 
+# Камера номеров отдаёт номер латиницей, заглавными, добитым нулями до 10 Б, а плата сравнивает побайтно:
+# русские буквы номера (их латинские двойники) переводятся, остальное должно быть латиницей и цифрами.
+PLATE_LETTERS = str.maketrans('АВЕКМНОРСТУХавекмнорстух', 'ABEKMHOPCTYXABEKMHOPCTYX')
+
+
+def plate_latin(text):
+    plate = text.strip().translate(PLATE_LETTERS).upper()
+    if not 1 <= len(plate) <= 10 or not plate.isascii() or not plate.isalnum():
+        raise ValueError('Автономер: до 10 латинских букв и цифр без пробелов (русские АВЕКМНОРСТУХ переводятся сами)')
+    return plate
+
+
 def id_record(row):
-    identifier = row['identifier'].encode('cp1251')
+    kind = integer(row['kind'], 1, 6, 'Тип ID')
+    identifier = (plate_latin(row['identifier']) if kind == 3 else row['identifier']).encode('cp1251')
     if not 1 <= len(identifier) <= 10 or b'\0' in identifier:
         raise ValueError('ID: от 1 до 10 символов Windows-1251')
-    kind = integer(row['kind'], 1, 6, 'Тип ID')
     daily = integer(row['daily'], 1, 255, 'Лимит проходов')
     if 251 <= daily <= 254:
         raise ValueError('Лимит: 1–250 или 255 (без ограничения)')

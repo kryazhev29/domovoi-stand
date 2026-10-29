@@ -1,4 +1,5 @@
 """Рабочее место для диагностики и ручной работы с контроллерами."""
+import configparser
 import csv
 import datetime as dt
 import json
@@ -6,6 +7,7 @@ import os
 import queue
 import sqlite3
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -15,9 +17,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import test_server as stand
-from naviset_data import id_record, group_record, schedule_record, payloads, integer
+from naviset_data import id_record, group_record, schedule_record, payloads, integer, plate_latin
 from naviset_dashboard import Dashboard, apply_theme, enable_dpi_awareness
 from naviset_photo import PhotoPreview
+from rs485_config import load_names
 
 
 KINDS = ['1 — Телефон', '2 — RFID 485', '3 — Автономер', '4 — RF433', '5 — Wiegand', '6 — ПИН']
@@ -45,6 +48,25 @@ COMMANDS = {2: 'Перезагрузка', 3: 'Заводские настрой
             12: 'Настройки', 13: 'Абоненты', 14: 'Расписания', 15: 'Группы', 16: 'Праздники',
             17: 'CRC структур', 18: 'CRC ID', 19: 'Обновление', 20: 'Блок прошивки',
             21: 'Получить фото', 22: 'Статус', 23: 'Время'}
+ANPR_TYPE = 8               # камера номеров Interceptor
+CAMERA_TYPES = (ANPR_TYPE, 9)  # и фотокамера JPEG (OV); типы 485 группами по 8, Протокол2 28.10.2026
+
+
+def periphery_types():
+    """Типы линии 485 по справочнику сервера: periphery.ini рядом со скриптом или exe, иначе список Протокол2."""
+    folder = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+    try:
+        return load_names(folder / 'periphery.ini')['types']
+    except (OSError, ValueError, KeyError, configparser.Error):
+        return {0: 'Отключено', 1: 'WiFi модем UG164', 8: '485 фотокамера домовой Interceptor',
+                9: '485 фотокамера JPEG (OV)', 16: '485 кодовая панель Tantos 100', 24: '485 RFID AXOS'}
+
+
+PERIPHERY = periphery_types()
+
+
+def periphery_choice(code):
+    return f'{code} — {PERIPHERY.get(code, "нет в справочнике")}'
 
 
 class App:
@@ -332,7 +354,7 @@ class App:
                     'Отправляется полный снимок выбранной структуры. Неуказанные записи очищаются или блокируются.')
             ttk.Label(page, text=text, style='Hint.TLabel', wraplength=650).pack(anchor='w')
 
-    def edit_row(self, kind, editing=False):
+    def edit_row(self, kind, editing=False, preset=None):
         self.board()
         data = self.store.get(self.imei)
         rows = data.setdefault(kind, [])
@@ -340,7 +362,7 @@ class App:
         index = int(selection[0]) if editing and selection else None
         if editing and index is None:
             raise ValueError('Выберите запись')
-        row = rows[index] if index is not None else {}
+        row = rows[index] if index is not None else dict(preset or {})
         window = tk.Toplevel(self.root)
         window.title(TITLES[kind])
         window.transient(self.root)
@@ -376,6 +398,8 @@ class App:
                     result[key] = int(result[key][0])
                 elif isinstance(control, tk.BooleanVar):
                     result[key] = int(result[key])
+            if kind == 'ids' and result['kind'] == 3:
+                result['identifier'] = plate_latin(result['identifier'])  # как отдаёт камера номеров
             if kind == 'holidays':
                 payloads(kind, {kind: [result]})
             else:
@@ -459,20 +483,27 @@ class App:
                 self.settings_fields[key] = value
             else:
                 self.settings_fields[key] = self.entry(page, label)
-        ttk.Label(page, text='Камеры и считыватели RS-485 (адрес / тип)', font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=8)
-        row = ttk.Frame(page)
-        row.pack(fill='x')
+        ttk.Label(page, text='Линия RS-485: что включено', font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(14, 4))
+        ttk.Label(page, text='Устройства по адресам работают в режиме «Активный опрос». Камера номеров Interceptor — '
+                             'адрес 48: в её настройках serialAddr 48, это символ «0». Wi-Fi-модем плата включает по USB '
+                             '(NextConfig), а не по этой таблице; пока он выбран, линия 485 занята мостом. '
+                             '«Сейчас» — ответы устройств по последнему статусу 2 платы.',
+                  style='Hint.TLabel', wraplength=670).pack(anchor='w')
+        grid = ttk.Frame(page)
+        grid.pack(fill='x', pady=4)
+        for column, title in enumerate(('№', 'Устройство', 'Адрес', 'Сейчас')):
+            ttk.Label(grid, text=title, style='Hint.TLabel').grid(row=0, column=column, sticky='w', padx=4)
         self.peripherals = []
+        choices = [periphery_choice(code) for code in PERIPHERY]
         for i in range(8):
-            box = ttk.Frame(row)
-            box.pack(side='left', padx=4)
-            ttk.Label(box, text=f'№{i+1}').pack()
-            a, t = tk.StringVar(value='0'), tk.StringVar(value='0')
-            ttk.Entry(box, textvariable=a, width=5).pack()
-            ttk.Entry(box, textvariable=t, width=5).pack()
-            self.peripherals.append((a, t))
-        ttk.Label(page, text='Тип: 0 нет · 1 Wi-Fi · 2 Interceptor · 3 JPEG (OV)', style='Hint.TLabel').pack(anchor='w', pady=8)
-        ttk.Button(page, text='Сохранить и отправить настройки', command=self.save_settings).pack(anchor='w', pady=12)
+            kind, addr, state = tk.StringVar(value=choices[0]), tk.StringVar(value='0'), tk.StringVar(value='—')
+            ttk.Label(grid, text=str(i + 1)).grid(row=i + 1, column=0, sticky='w', padx=4)
+            ttk.Combobox(grid, textvariable=kind, values=choices, state='readonly', width=38).grid(row=i + 1, column=1, sticky='w', padx=4, pady=1)
+            ttk.Spinbox(grid, textvariable=addr, from_=0, to=255, width=6).grid(row=i + 1, column=2, sticky='w', padx=4)
+            ttk.Label(grid, textvariable=state).grid(row=i + 1, column=3, sticky='w', padx=4)
+            self.peripherals.append((kind, addr, state))
+        self.buttons(page, [('Сохранить и отправить настройки', self.save_settings),
+                            ('Обновить «Сейчас» (статус 2)', lambda: self.command(22))])
 
     def import_settings(self):
         self.board()
@@ -508,9 +539,18 @@ class App:
                     if not sep or not host or not port.isdecimal() or not 1 <= int(port) <= 65535:
                         raise ValueError(f'{label}: нужен адрес:порт')
                 result[offset:offset+size] = raw.ljust(size, b'\0')
-        for i, (addr, typ) in enumerate(self.peripherals):
-            result[179+i*2] = integer(addr.get(), 0, 255, 'Адрес периферии')
-            result[180+i*2] = integer(typ.get(), 0, 255, 'Тип периферии')
+        used = set()
+        for i, (kind, addr, _) in enumerate(self.peripherals):
+            code = integer(kind.get().split(' — ')[0], 0, 255, f'Устройство 485 №{i+1}')
+            address = integer(addr.get(), 0, 255, f'Адрес устройства 485 №{i+1}')
+            if code and not address:
+                raise ValueError(f'Устройство 485 №{i+1}: адрес 1–255, адрес 0 — резерв')
+            if code and address in used:
+                raise ValueError(f'Адрес {address} на линии 485 уже занят другим устройством')
+            used.add(address if code else None)
+            result[179+i*2], result[180+i*2] = (address, code) if code else (0, 0)
+        if used - {None} and not result[172]:
+            raise ValueError('Устройства по адресам работают только в режиме «Активный опрос»: выберите его в «Режим RS-485»')
         result[510:] = struct.pack('<H', stand.crc16(result[:510]))
         data['settings'] = result.hex()
         self.store.put(self.imei, data)
@@ -589,6 +629,15 @@ class App:
         self.camera_format = tk.StringVar(value='ДОМОВОЙ NEXT')
         ttk.Combobox(compatibility, textvariable=self.camera_format, values=('ДОМОВОЙ NEXT', 'Протокол2'),
                      state='readonly', width=20).pack(side='left')
+        plate = ttk.LabelFrame(page, text='Камера номеров Interceptor (тип 8)', padding=8)
+        plate.pack(fill='x', pady=(2, 4))
+        self.plate_note = tk.StringVar(value='Номер с камеры ещё не считывали')
+        ttk.Label(plate, textvariable=self.plate_note, wraplength=680).pack(anchor='w')
+        self.buttons(plate, [('Считать номер с камеры (15 с)', self.read_plate),
+                             ('Добавить номер в базу…', self.add_plate)])
+        ttk.Label(plate, text='Номер считывает плата по адресу камеры выше. Снимок камера отдаёт, только пока номер в кадре: '
+                              'держите номер перед камерой и нажмите «Сделать снимок». Для прохода номер нужен в базе, '
+                              'а группа — с разрешением «Автономер».', style='Hint.TLabel', wraplength=680).pack(anchor='w')
         self.photo_preview = PhotoPreview(page)
         self.photo_preview.canvas.configure(height=round(270*self.ui_scale))
         self.photo_preview.pack(fill='both', expand=True, pady=(6, 0))
@@ -606,6 +655,17 @@ class App:
         data = self.store.get(self.imei)
         data.update(camera_address=addr, camera_format=self.camera_format.get())
         self.store.put(self.imei, data)
+
+    def read_plate(self):
+        """Захват 6: источник 485, адрес камеры; номер придёт пакетом 8."""
+        self.command(6, bytes([15, 3, integer(self.camera.get(), 1, 255, 'Адрес камеры')]))
+
+    def add_plate(self):
+        """Форма ID «Автономер» с последним считанным номером; передача — «Сохранить и синхронизировать»."""
+        reader = self.board().last_reader
+        plate = stand.text10(reader[2]) if reader and reader[1] == 1 else ''
+        self.navigate('Доступ')
+        self.edit_row('ids', preset={'identifier': plate, 'kind': 3})
 
     def open_photo(self):
         board = self.board()
@@ -641,7 +701,10 @@ class App:
         if not self.imei:
             return
         data = self.store.get(self.imei)
-        self.camera.set(str(data.get('camera_address', 1)))
+        raw = bytes.fromhex(data.get('settings', ''))
+        cameras = [raw[179+i*2] for i in range(8) if len(raw) == 512 and raw[180+i*2] in CAMERA_TYPES and raw[179+i*2]]
+        saved = data.get('camera_address', 1)
+        self.camera.set(str(saved if saved in cameras or not cameras else cameras[0]))  # адрес из таблицы 485 важнее старого
         self.camera_format.set(data.get('camera_format', 'ДОМОВОЙ NEXT'))
         for kind, tree in self.tables.items():
             tree.delete(*tree.get_children())
@@ -665,7 +728,6 @@ class App:
         for v, val in zip(self.triggers, triggers):
             v.set(bool(val))
         self.call_schedule.set(triggers[7])
-        raw = bytes.fromhex(data.get('settings', ''))
         self.setting_note.set('Копия настроек загружена' if len(raw) == 512 else 'Копия настроек не загружена')
         for key, _, off, size in self.setting_layout:
             value = (raw[off] if size == 1 else raw[off:off+size].split(b'\0')[0].decode('ascii', 'replace')) if len(raw) == 512 else ''
@@ -673,9 +735,9 @@ class App:
                 options = self.setting_choices[key]
                 value = options[value] if isinstance(value, int) and value < len(options) else ''
             self.settings_fields[key].set(value)
-        for i, (a, t) in enumerate(self.peripherals):
-            a.set(raw[179+i*2] if len(raw) == 512 else 0)
-            t.set(raw[180+i*2] if len(raw) == 512 else 0)
+        for i, (kind, addr, _) in enumerate(self.peripherals):
+            kind.set(periphery_choice(raw[180+i*2] if len(raw) == 512 else 0))
+            addr.set(raw[179+i*2] if len(raw) == 512 else 0)
         self.firmware.set(data.get('firmware_file', ''))
         self.firmware_info.set('Имя файла: HW.FW.номер_сборки.bin')
         self.firmware_progress.set('Обновление не запускалось для этой платы')
@@ -744,6 +806,21 @@ class App:
                 self._event_signature = signature
             self.photo_note.set(f'Получено фотографий: {len(board.completed_photos)} · ' +
                                 ('Принимаем фото…' if board.busy_photo else 'Ожидание следующего снимка'))
+            # Ответы устройств 485 — состояние периферии статуса 2; включённые — по сохранённой копии настроек.
+            states = bytes.fromhex(details['peripherals']) if details and details.get('peripherals') else b''
+            settings = bytes.fromhex(data.get('settings', ''))
+            settings = settings if len(settings) == 512 else bytes(512)
+            for i, (_, _, state) in enumerate(self.peripherals):
+                state.set('—' if not settings[180+i*2] or len(states) < 8 else 'отвечает' if states[i] else 'нет ответа')
+            text = 'Номер с камеры ещё не считывали'
+            if board.last_reader:
+                stamp, code, raw = board.last_reader
+                text = ((f'Считан номер «{stand.text10(raw)}»' if code == 1 else 'Номер не считан: время вышло') +
+                        f' · {dt.datetime.fromtimestamp(stamp):%H:%M:%S}')
+            camera = next((i for i in range(8) if settings[180+i*2] == ANPR_TYPE), None)
+            if camera is not None and len(states) == 8:
+                text += f' · камера номеров, адрес {settings[179+camera*2]}: ' + ('отвечает' if states[camera] else 'нет ответа')
+            self.plate_note.set(text)
             if not board.image:
                 self.firmware_progress.set('Обновление не запускалось для этой платы')
             else:

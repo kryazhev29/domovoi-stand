@@ -3,6 +3,7 @@ import json
 import math
 import queue
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -226,9 +227,92 @@ class ProfileTests(unittest.TestCase):
                     read_profile(path)
 
 
+class DataTests(unittest.TestCase):
+    def test_plate_is_stored_like_the_number_camera_sends_it(self):
+        from naviset_data import id_record, plate_latin
+        self.assertEqual(plate_latin(' а001хн197 '), 'A001XH197')
+        self.assertEqual(plate_latin('c020pm177'), 'C020PM177')
+        for bad in ('', 'А 001', 'Д001ДД77', 'A001XH19777'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                plate_latin(bad)
+        row = dict(cell=5, identifier='С020РМ177', group=1, kind=3, expiry='', minutes=0, daily=255, remaining=255)
+        self.assertEqual(id_record(row)[2:12], b'C020PM177\x00')
+        row.update(kind=1, identifier='9031234567')
+        self.assertEqual(id_record(row)[2:12], b'9031234567')
+
+    def test_periphery_list_without_ini_matches_stand_ini(self):
+        import naviset_ui
+        with patch('naviset_ui.load_names', side_effect=ValueError('нет файла')):
+            types = naviset_ui.periphery_types()
+        self.assertEqual(types, naviset_ui.PERIPHERY)
+        self.assertEqual(sorted(types), [0, 1, 8, 9, 16, 24])
+
+
 class WindowTests(unittest.TestCase):
     setUp = NetworkTests.setUp
     cleanup_server = NetworkTests.cleanup_server
+
+    def test_rs485_table_status_and_number_camera(self):
+        from naviset_ui import App, periphery_choice
+        app = App(self.server, self.messages, self.server.say)
+        app.root.withdraw()
+
+        def close():  # без вопроса окна и без отложенного обновления в следующем тесте
+            app._closing = True
+            for pending in app.root.tk.call('after', 'info'):
+                app.root.after_cancel(pending)
+            app.root.destroy()
+        self.addCleanup(close)
+        app.root.update()
+        app.select()
+        imei = self.board.imei
+        raw = bytearray(512)
+        raw[510:] = struct.pack('<H', stand.crc16(raw[:510]))
+        data = app.store.get(imei)
+        data['settings'] = raw.hex()
+        app.store.put(imei, data)
+        app.load_data()
+        self.assertEqual(app.peripherals[0][0].get(), periphery_choice(0))
+        # Камера номеров по адресу 48: пассивный режим, повтор адреса и адрес 0 не уходят на плату.
+        app.peripherals[0][0].set(periphery_choice(8))
+        app.peripherals[0][1].set('48')
+        with self.assertRaisesRegex(ValueError, 'Активный опрос'):
+            app.save_settings()
+        app.settings_fields['mode485'].set('Активный опрос')
+        app.peripherals[1][0].set(periphery_choice(9))
+        app.peripherals[1][1].set('48')
+        with self.assertRaisesRegex(ValueError, 'занят'):
+            app.save_settings()
+        app.peripherals[1][1].set('0')
+        with self.assertRaisesRegex(ValueError, 'резерв'):
+            app.save_settings()
+        app.peripherals[1][0].set(periphery_choice(0))
+        app.save_settings()
+        self.assertTrue(self.board.until(lambda: self.fake.tables[12][172] == 1 and self.fake.tables[12][179:183] == bytes([48, 8, 0, 0]), 4))
+        # Адрес камеры для снимка и захвата берётся из таблицы 485, даже если раньше сохранили другой.
+        data = app.store.get(imei)
+        data['camera_address'] = 5
+        app.store.put(imei, data)
+        app.load_data()
+        self.assertEqual(app.camera.get(), '48')
+        # «Сейчас»: камера отвечает по статусу 2, пустая строка без отметки.
+        self.fake.periphery = bytes([1]) + bytes(7)
+        app.command(22)
+        self.assertTrue(self.board.until(lambda: self.board.details and self.board.details['peripherals'].startswith('01'), 4))
+        app.refresh_board()
+        self.assertEqual([state.get() for _, _, state in app.peripherals[:2]], ['отвечает', '—'])
+        self.assertIn('камера номеров, адрес 48: отвечает', app.plate_note.get())
+        # Захват 6 «485, адрес камеры»: номер латиницей с нулём из пакета 8.
+        self.fake.reader_answer = b'A001XH197\x00'
+        with patch.object(app, 'command', wraps=app.command) as command:
+            app.read_plate()
+            command.assert_called_once_with(6, bytes([15, 3, 48]))
+        self.assertTrue(self.board.until(lambda: self.board.last_reader and self.board.last_reader[1] == 1, 4))
+        app.refresh_board()
+        self.assertIn('Считан номер «A001XH197»', app.plate_note.get())
+        with patch.object(app, 'edit_row') as edit:
+            app.add_plate()
+            edit.assert_called_once_with('ids', preset={'identifier': 'A001XH197', 'kind': 3})
     # Отдельный экземпляр окна; основной сервер 15010 не используется.
     def test_window_diagnostics_switching_and_refresh_recovery(self):
         from naviset_ui import App

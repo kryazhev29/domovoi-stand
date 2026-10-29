@@ -57,6 +57,8 @@ class FakeBoard:
         self.photo_number = 0
         self.ids = {}
         self.next_status = 0
+        self.reader_answer = None  # 10 Б: захват 6 отдаёт этот ID (номер с камеры) через 0,1 с, иначе таймаут
+        self.periphery = bytes(8)  # состояние периферии 485 в статусе 2
 
     def now(self):
         return int(time.time() + self.time_offset)
@@ -138,7 +140,7 @@ class FakeBoard:
         elif cmd == 6:
             self.answer(cmd, uid, 0 if len(data) == 3 and data[0] else 1)
             if len(data) == 3 and data[0]:
-                self.reader_due = time.monotonic() + data[0]
+                self.reader_due = time.monotonic() + (0.1 if self.reader_answer else data[0])
         elif cmd == 7:
             self.answer(cmd, uid)
             self.photo_number = max(self.photo_number+1, self.now())
@@ -290,7 +292,8 @@ class FakeBoard:
                     self.emit(14, bytes([1])+struct.pack('<IIH', self.photo_number, len(self.photo), pos)+self.photo[pos:pos+1024])
                 self.emit(14, bytes(1))
         elif cmd == 22:
-            self.emit(3, struct.pack('<IBHBIB', self.now(), 23, 250, self.fw, self.build, 0x32)+bytes(8), uid)
+            # Протокол2 27.10.2026: за периферией входы 1/2, выходы 1/2, оператор (2 МегаФон), сеть (3 LTE).
+            self.emit(3, struct.pack('<IBHBIB', self.now(), 23, 250, self.fw, self.build, 0x32)+self.periphery+bytes([0, 0, 0, 0, 2, 3]), uid)
         elif cmd == 23:
             if len(data) != 4:
                 self.answer(cmd, uid, 1)
@@ -314,7 +317,7 @@ class FakeBoard:
         if self.out_due and now >= self.out_due:
             self.out_due = 0; self.flags &= ~2; self.status()
         if self.reader_due and now >= self.reader_due:
-            self.reader_due = 0; self.emit(8, bytes([255])+bytes(10))
+            self.reader_due = 0; self.emit(8, bytes([1])+self.reader_answer if self.reader_answer else bytes([255])+bytes(10))
         if self.sync_due and now >= self.sync_due:
             self.sync_due = 0
             for kind in sorted(self.sync):

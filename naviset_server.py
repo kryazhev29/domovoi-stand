@@ -73,6 +73,7 @@ class Board(stand.Board):
         self.deferred_photo = None
         self.data_store = data_store
         self.details = None
+        self.last_reader = None  # (время, код, 10 Б) последнего пакета 8
         self.sync_plan = []
         self.photo_activity = 0.0
         self.photo_sizes = {}
@@ -260,6 +261,8 @@ class Board(stand.Board):
         if answer and original in SYNC_KIND:
             self.sync_plan.clear()
             self.say(f'[{self.imei}] синхронизация остановлена: отказ команды {original}, код {answer}', 'bad')
+        if cmd == 8:  # ответ на захват 6: номер с камеры или ID со считывателя
+            self.last_reader = (time.time(), payload[0], bytes(payload[1:11]))
         if cmd == 3:
             values = struct.unpack_from('<IBHBIB', payload)
             self.details = dict(time=values[0], signal=values[1], balance=values[2], firmware=values[3],
