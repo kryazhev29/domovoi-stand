@@ -49,7 +49,7 @@ def apply_theme(root):
     style.configure('Side.TButton', background='#223952', foreground='#eaf2ff')
     style.map('Side.TButton', background=[('active', '#304c70')], foreground=[('active', 'white')])
     style.configure('Nav.TButton', anchor='w', background='#14243c', foreground='#c8d5e7',
-                    borderwidth=0, padding=(14, 10))
+                    borderwidth=0, padding=(14, 7))
     style.map('Nav.TButton', background=[('active', '#223952')], foreground=[('active', 'white')])
     style.configure('Selected.Nav.TButton', background='#2563eb', foreground='white')
     style.map('Selected.Nav.TButton', background=[('active', '#3472f0')], foreground=[('active', 'white')])
@@ -181,8 +181,8 @@ class Dashboard:
                   style='Hint.TLabel', wraplength=700).pack(anchor='w', pady=12)
         manual = ttk.Frame(parent)
         manual.pack(fill='x')
-        for title, page in (('Реле и считыватель →', 'Контроллер'), ('Камера и события →', 'Фото и журнал')):
-            ttk.Button(manual, text=title, command=lambda p=page: app.navigate(p)).pack(side='left', padx=(0, 8))
+        for title, command in (('Реле и считыватель →', lambda: app.navigate('Контроллер')), ('Камера и снимки →', app.open_camera)):
+            ttk.Button(manual, text=title, command=command).pack(side='left', padx=(0, 8))
 
     def render(self, imei):
         self.displayed = imei

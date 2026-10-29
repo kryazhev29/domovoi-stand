@@ -11,7 +11,10 @@ from test_server import crc16
 
 
 def integer(value, low, high, label):
-    number = int(value)
+    text = str(value).strip()
+    if not text.isascii() or not text.lstrip('-').isdecimal():
+        raise ValueError(f'{label}: введите число {low}–{high}' if text else f'{label}: поле пустое — введите число {low}–{high}')
+    number = int(text)
     if not low <= number <= high:
         raise ValueError(f'{label}: допустимо {low}–{high}')
     return number

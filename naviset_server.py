@@ -19,6 +19,7 @@ from pathlib import Path
 import test_server as stand
 from naviset_queue import CommandQueue, SYNC_KIND, answer_code
 from naviset_data import DataStore
+from naviset_shots import CAMERAS, jpeg_header
 
 
 DEFAULTS = dict(registration_timeout=5.0, heartbeat_timeout=30.0,
@@ -393,6 +394,7 @@ class Board(stand.Board):
                 stream.flush()
                 os.fsync(stream.fileno())
             temporary.replace(final)
+            self.say(f'Снимок №{number} принят: {stand.PHOTOS.name}\\{final.name} ({CAMERAS[jpeg_header(data)[0]]})', 'good')
             self.completed_photos.add(number)
             self.photo_last_complete = (number, size)
         # Сохраняем курсор после данных, до подтверждения контроллеру.

@@ -466,11 +466,19 @@ class Checks:
         return ok, f'ответ {code}, SMS на {phone[-10:]}: «{text}»'
 
     def c_фото(self):
-        addr = int(self.opts.get('camera', 1))
+        # Прошивка (photo_start) принимает один байт адреса; «7+адрес» из Excel всегда получает отказ 1.
+        # Адрес: camera=… в команде, иначе из копии настроек платы — JPEG-камера (тип 9), иначе камера номеров (тип 8).
+        from naviset_shots import JPEG_TYPE, PLATE_TYPE, answer_text, camera_of_address, table_addresses
+        store = getattr(self.b, 'data_store', None)
+        raw = bytes.fromhex(store.get(self.b.imei).get('settings', '')) if store and self.b.imei else b''
+        found = table_addresses(raw, JPEG_TYPE) + table_addresses(raw, PLATE_TYPE)
+        if 'camera' not in self.opts and not found:
+            return False, 'адрес камеры не известен: нет копии настроек с камерой в таблице 485; задайте camera=<адрес>'
+        addr = int(self.opts.get('camera', found[0] if found else 0))
         before = set(self.b.completed_photos)
-        ok, code = self.answer(7, bytes([7, addr]))
+        ok, code = self.answer(7, bytes([addr]))
         if not ok:
-            return False, f'ответ {code} (камеры нет или 485 не настроен)'
+            return False, f'ответ {code}: {answer_text(7, code, camera_of_address(raw, addr) or "jpeg", addr) if isinstance(code, int) else "нет ответа"}'
         self.b.until(lambda: self.b.completed_photos - before, 90)
         self.expect('фото', 129)
         complete = bool(self.b.completed_photos - before)

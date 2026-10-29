@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import os
 import queue
+import re
 import sqlite3
 import struct
 import sys
@@ -19,7 +20,11 @@ from tkinter import filedialog, messagebox, ttk
 import test_server as stand
 from naviset_data import id_record, group_record, schedule_record, payloads, integer, plate_latin
 from naviset_dashboard import Dashboard, apply_theme, enable_dpi_awareness
-from naviset_photo import PhotoPreview
+from naviset_photo import ShotPanel, fit_text
+from naviset_shots import (CAMERAS, CAUSES, FROM_TABLE, JPEG_TYPE, PLATE_TYPE, SHOT_SLACK, SHOT_WAIT, answer_text,
+                           camera_address, camera_of_address, camera_state, latest_plate, list_shots, local_when,
+                           reader_text, shot_done, shot_failed, table_addresses)
+from naviset_queue import answer_code
 from rs485_config import load_names
 
 
@@ -44,12 +49,13 @@ STATES = {'queued': 'В очереди', 'sent': 'Отправлено', 'done':
           'expired': 'Истёк срок', 'unknown': 'Результат неизвестен', 'cancelled': 'Отменено',
           'superseded': 'Заменено новым запросом'}
 COMMANDS = {2: 'Перезагрузка', 3: 'Заводские настройки', 5: 'Режимы', 6: 'Считать ID',
-            7: 'Сделать фото', 8: 'Выходы', 9: 'Журнал', 10: 'Временные ID', 11: 'SMS',
+            7: 'Сделать снимок', 8: 'Выходы', 9: 'Журнал', 10: 'Временные ID', 11: 'SMS',
             12: 'Настройки', 13: 'Абоненты', 14: 'Расписания', 15: 'Группы', 16: 'Праздники',
             17: 'CRC структур', 18: 'CRC ID', 19: 'Обновление', 20: 'Блок прошивки',
             21: 'Получить фото', 22: 'Статус', 23: 'Время'}
-ANPR_TYPE = 8               # камера номеров Interceptor
-CAMERA_TYPES = (ANPR_TYPE, 9)  # и фотокамера JPEG (OV); типы 485 группами по 8, Протокол2 28.10.2026
+CAMERA_TABS = {'JPEG-камера': 'jpeg', 'Камера номеров': 'plate'}   # 8 — камера номеров, 9 — фотокамера JPEG (OV)
+TAB_TYPES = {'JPEG-камера': JPEG_TYPE, 'Камера номеров': PLATE_TYPE}
+PASS_EVENTS = {69, 70, 71, 72, 73, 74, 75, 76, 77, 79, 80, 131}  # у них «проходы» в журнале значимы
 
 
 def periphery_types():
@@ -105,7 +111,7 @@ class App:
         self.peers.tag_configure('online', foreground='#16734b')
         self.peers.tag_configure('offline', foreground='#64748b')
         self.peers.bind('<<TreeviewSelect>>', self.select)
-        ttk.Button(left, text='Добавить / изменить…', style='Side.TButton', command=self.controller_dialog).pack(fill='x', pady=(8, 20))
+        ttk.Button(left, text='Добавить / изменить…', style='Side.TButton', command=self.controller_dialog).pack(fill='x', pady=(8, 12))
         navigation = ttk.Frame(left, style='Side.TFrame')
         navigation.pack(fill='x')
         self.heading = ttk.Label(right, text='Выберите контроллер слева', style='Hint.TLabel', wraplength=round(750*self.ui_scale))
@@ -114,7 +120,8 @@ class App:
         self.tabs.pack(fill='both', expand=True)
         self.pages = {}
         self.page_hosts, self.nav_buttons, self.canvases = {}, {}, {}
-        names = ('Проверка платы', 'Контроллер', 'Доступ', 'Фото и журнал', 'Прошивка', 'Настройки', 'Очередь', 'Обмен')
+        names = ('Проверка платы', 'Контроллер', 'Доступ', 'JPEG-камера', 'Камера номеров', 'Журнал',
+                 'Прошивка', 'Настройки', 'Очередь', 'Обмен')
         for name in names:
             host = ttk.Frame(self.tabs)
             self.tabs.add(host, text=name)
@@ -136,7 +143,12 @@ class App:
         self.make_access()
         self.make_settings()
         self.make_firmware()
-        self.make_media()
+        # Команды вкладок камер для «Последней команды», список снимков и адреса камер.
+        self.pending, self.shots, self._shots_key = {}, [], None
+        self.address_notes, self.address_hints, self.camera_states, self.auto_address = {}, {}, {}, {}
+        self.make_jpeg()
+        self.make_plate()
+        self.make_journal()
         self.make_queue()
         self.log = tk.Text(self.pages['Обмен'], wrap='word', state='disabled', font=('Consolas', 10))
         log_scroll = ttk.Scrollbar(self.pages['Обмен'], command=self.log.yview)
@@ -515,6 +527,7 @@ class App:
         payloads('settings', data)
         self.store.put(self.imei, data)
         self.load_data()
+        self.apply_camera_addresses(force=True)
 
     def save_settings(self):
         if self.board().check_lock.locked():
@@ -554,6 +567,7 @@ class App:
         result[510:] = struct.pack('<H', stand.crc16(result[:510]))
         data['settings'] = result.hex()
         self.store.put(self.imei, data)
+        self.apply_camera_addresses(force=True)  # новые строки 485 сразу видны во вкладках камер
         self.synchronize('settings')
 
     def make_firmware(self):
@@ -612,67 +626,244 @@ class App:
         if messagebox.askyesno('Откат', 'Запросить предыдущую прошивку из резервной копии контроллера?', parent=self.root):
             self.command(19, struct.pack('<HIIIH', 1, 0, 0, 0, 0))
 
-    def make_media(self):
-        page = self.pages['Фото и журнал']
-        ttk.Label(page, text='Камера и события', style='Title.TLabel').pack(anchor='w', pady=(0, 8))
-        camera_row = ttk.Frame(page)
-        camera_row.pack(fill='x')
-        ttk.Label(camera_row, text='Адрес камеры').pack(side='left')
-        self.camera = tk.StringVar(value='1')
-        ttk.Spinbox(camera_row, textvariable=self.camera, from_=1, to=255, width=5).pack(side='left', padx=8)
-        ttk.Button(camera_row, text='Сделать снимок', style='Accent.TButton', command=self.take_photo).pack(side='left', padx=4)
-        ttk.Button(camera_row, text='Получить фото', command=lambda: self.command(21, bytes(6))).pack(side='left', padx=4)
-        ttk.Button(camera_row, text='Оригинал ↗', command=self.open_photo).pack(side='right')
-        compatibility = ttk.Frame(page)
-        compatibility.pack(fill='x', pady=6)
-        ttk.Label(compatibility, text='Формат камеры').pack(side='left', padx=(0, 8))
-        self.camera_format = tk.StringVar(value='ДОМОВОЙ NEXT')
-        ttk.Combobox(compatibility, textvariable=self.camera_format, values=('ДОМОВОЙ NEXT', 'Протокол2'),
-                     state='readonly', width=20).pack(side='left')
-        plate = ttk.LabelFrame(page, text='Камера номеров Interceptor (тип 8)', padding=8)
-        plate.pack(fill='x', pady=(2, 4))
-        self.plate_note = tk.StringVar(value='Номер с камеры ещё не считывали')
-        ttk.Label(plate, textvariable=self.plate_note, wraplength=680).pack(anchor='w')
-        self.buttons(plate, [('Считать номер с камеры (15 с)', self.read_plate),
-                             ('Добавить номер в базу…', self.add_plate)])
-        ttk.Label(plate, text='Номер считывает плата по адресу камеры выше. Снимок камера отдаёт, только пока номер в кадре: '
-                              'держите номер перед камерой и нажмите «Сделать снимок». Для прохода номер нужен в базе, '
-                              'а группа — с разрешением «Автономер».', style='Hint.TLabel', wraplength=680).pack(anchor='w')
-        self.photo_preview = PhotoPreview(page)
-        self.photo_preview.canvas.configure(height=round(270*self.ui_scale))
-        self.photo_preview.pack(fill='both', expand=True, pady=(6, 0))
-        self.photo_note = tk.StringVar(value='Фото пока нет')
-        ttk.Label(page, textvariable=self.photo_note, style='Hint.TLabel').pack(anchor='w', pady=8)
-        event_head = ttk.Frame(page)
-        event_head.pack(fill='x')
-        ttk.Label(event_head, text='Журнал событий', style='Subtitle.TLabel').pack(side='left')
-        ttk.Button(event_head, text='Получить журнал', command=lambda: self.command(9)).pack(side='right', pady=3)
-        self.events = self.tree(page, [('time', 'Время UTC', 115), ('event', 'Событие', 440)], height=4)
+    def camera_head(self, page, title, hint):
+        ttk.Label(page, text=title, style='Title.TLabel').pack(anchor='w')
+        fit_text(ttk.Label(page, text=hint, style='Hint.TLabel')).pack(fill='x', pady=(2, 12))
 
-    def take_photo(self):
-        addr = integer(self.camera.get(), 1, 255, 'Адрес камеры')
-        self.command(7, bytes([addr]) if self.camera_format.get() == 'ДОМОВОЙ NEXT' else bytes([7, addr]))
+    def card(self, parent, title, wrap):
+        """Белая карточка как на главной: подпись заглавными и значение."""
+        box = ttk.Frame(parent, style='Card.TFrame', padding=14)
+        ttk.Label(box, text=title, style='Card.TLabel').pack(anchor='w')
+        value = ttk.Label(box, text='—', style='Card.TLabel', font=('Segoe UI', 11), justify='left', wraplength=round(wrap*self.ui_scale))
+        value.pack(anchor='w', pady=(6, 0))
+        return box, value
+
+    def camera_controls(self, page, tab, address):
+        """Одинаково на обеих вкладках: адрес, пояснение под полем, «Камера: …» по статусу 2 и кнопка обновления."""
+        row = ttk.Frame(page)
+        row.pack(fill='x')
+        ttk.Label(row, text='Адрес камеры').pack(side='left')
+        ttk.Spinbox(row, textvariable=address, from_=1, to=255, width=5).pack(side='left', padx=8)
+        self.address_notes[tab] = fit_text(ttk.Label(page, text='', style='Hint.TLabel', justify='left'))
+        self.address_notes[tab].pack(fill='x', pady=(4, 0))
+        line = ttk.Frame(page)
+        line.pack(fill='x', pady=(8, 0))
+        ttk.Button(line, text='Обновить (статус 2)', command=lambda: self.command(22)).pack(side='right', anchor='n', padx=(12, 0))
+        self.camera_states[tab] = fit_text(ttk.Label(line, text='Камера: неизвестно', justify='left'))
+        self.camera_states[tab].pack(side='left', fill='x', expand=True)
+        return row
+
+    def make_jpeg(self):
+        page = self.pages['JPEG-камера']
+        self.camera_head(page, 'JPEG-камера', 'Фотокамера на линии 485 (тип 9). Снимает при проходе, по тревоге и по кнопке «Сделать снимок».')
+        self.jpeg_address = tk.StringVar()
+        row = self.camera_controls(page, 'JPEG-камера', self.jpeg_address)
+        ttk.Button(row, text='Сделать снимок', style='Accent.TButton', command=self.take_jpeg).pack(side='left', padx=(4, 0))
+        self.jpeg_note, self.jpeg_state = self.address_notes['JPEG-камера'], self.camera_states['JPEG-камера']
+        box, self.jpeg_result = self.card(page, 'ПОСЛЕДНЯЯ КОМАНДА', 820)
+        box.pack(fill='x', pady=(12, 12))
+        self.jpeg_shots = ShotPanel(page, self, 'jpeg', [('time', 'Время', 100), ('cause', 'Причина', 330),
+                                                         ('size', 'Размер', 65)], lambda: stand.PHOTOS)
+        self.jpeg_shots.pack(fill='both', expand=True)
+
+    def make_plate(self):
+        page = self.pages['Камера номеров']
+        self.camera_head(page, 'Камера номеров', 'Interceptor на линии 485 (тип 8). Читает номер машины; '
+                                                 'снимок отдаёт, только пока номер в кадре.')
+        self.plate_address = tk.StringVar(value='48')
+        self.camera_controls(page, 'Камера номеров', self.plate_address)
+        self.plate_note, self.plate_state = self.address_notes['Камера номеров'], self.camera_states['Камера номеров']
+        actions = ttk.Frame(page)
+        actions.pack(fill='x', pady=(10, 12))
+        for text, callback, style in (('Считать номер и снять', lambda: self.read_plate(True), 'Accent.TButton'),
+                                      ('Считать номер (15 с)', self.read_plate, 'TButton'),
+                                      ('Сделать снимок', self.shoot_plate, 'TButton'),
+                                      ('Добавить номер в базу…', self.add_plate, 'TButton')):
+            ttk.Button(actions, text=text, style=style, command=callback).pack(side='left', padx=(0, 6))
+        cards = ttk.Frame(page)
+        cards.pack(fill='x', pady=(0, 12))
+        cards.columnconfigure(0, weight=1, uniform='card')
+        cards.columnconfigure(1, weight=2, uniform='card')
+        box, self.plate_number = self.card(cards, 'ПОСЛЕДНИЙ НОМЕР', 260)
+        box.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
+        self.plate_number.configure(font=('Segoe UI', 17, 'bold'))
+        self.plate_when = ttk.Label(box, text='', style='Card.TLabel', foreground='#64748b', justify='left',
+                                    wraplength=round(260*self.ui_scale))
+        self.plate_when.pack(anchor='w')
+        box, self.plate_result = self.card(cards, 'ПОСЛЕДНЯЯ КОМАНДА', 520)
+        box.grid(row=0, column=1, sticky='nsew')
+        self.plate_shots = ShotPanel(page, self, 'plate', [('time', 'Время', 100), ('plate', 'Номер машины', 110),
+                                                           ('reason', 'Причина', 230), ('size', 'Размер', 65)], lambda: stand.PHOTOS)
+        self.plate_shots.pack(fill='both', expand=True)
+
+    def make_journal(self):
+        page = self.pages['Журнал']
+        head = ttk.Frame(page)
+        head.pack(fill='x')
+        ttk.Label(head, text='Журнал событий', style='Title.TLabel').pack(side='left')
+        ttk.Button(head, text='Получить журнал', command=lambda: self.command(9)).pack(side='right')
+        fit_text(ttk.Label(page, text='Последние 150 записей платы, новые сверху. Время местное, по часам этого компьютера '
+                                      '(плата хранит его в UTC). Новые записи «Нависет» забирает сам, когда плата сообщает '
+                                      'о них; кнопка — запросить сейчас.',
+                           style='Hint.TLabel')).pack(fill='x', pady=(2, 12))
+        self.events = self.tree(page, [('time', 'Время', 125), ('code', 'Код', 55), ('event', 'Событие', 280),
+                                       ('detail', 'Данные', 300)], height=16)
+        for key in ('time', 'code'):
+            self.events.column(key, stretch=False)
+
+    def remember(self, key, value):
         data = self.store.get(self.imei)
-        data.update(camera_address=addr, camera_format=self.camera_format.get())
+        data[key] = value
         self.store.put(self.imei, data)
 
-    def read_plate(self):
-        """Захват 6: источник 485, адрес камеры; номер придёт пакетом 8."""
-        self.command(6, bytes([15, 3, integer(self.camera.get(), 1, 255, 'Адрес камеры')]))
+    def camera_field(self, variable, camera):
+        """Адрес из поля; пустое поле — подсказка по-русски, а не ошибка Python."""
+        if not variable.get().strip():
+            raise ValueError(f'Введите адрес {camera} (1–255) или загрузите копию настроек во вкладке «Настройки»')
+        return integer(variable.get(), 1, 255, f'Адрес {camera}')
+
+    def take_jpeg(self):
+        """Команда 7: один байт адреса, как принимает прошивка."""
+        address = self.camera_field(self.jpeg_address, 'JPEG-камеры')
+        self.camera_command('JPEG-камера', 'Сделать снимок', 7, address)
+        self.remember('jpeg_address', address)
+
+    def plate_camera(self):
+        address = self.camera_field(self.plate_address, 'камеры номеров')
+        self.remember('plate_address', address)
+        return address
+
+    def read_plate(self, shoot=False):
+        """Захват 6: 15 с, источник 485, адрес камеры; номер придёт пакетом 8. shoot — сразу за номером команда 7."""
+        address = self.plate_camera()
+        self.camera_command('Камера номеров', 'Считать номер и снять' if shoot else 'Считать номер', 6, address,
+                            bytes([15, 3, address]), shoot)
+
+    def shoot_plate(self):
+        self.camera_command('Камера номеров', 'Сделать снимок', 7, self.plate_camera())
+
+    def camera_command(self, tab, label, cmd, address, payload=None, shoot=False, prefix=''):
+        """Отправить и запомнить, чтобы карточка «Последняя команда» вкладки показала ответ платы и итог.
+        Отметки — до отправки: ответ модели платы приходит раньше, чем send() вернётся.
+        Камера для текстов — по типу строки 485 с этим адресом, если копия настроек это знает."""
+        board = self.board()
+        raw = bytes.fromhex(self.store.get(self.imei).get('settings', ''))
+        op = dict(imei=self.imei, cmd=cmd, address=address, shoot=shoot, prefix=prefix, answer=None, answered=None,
+                  started=time.time(), mark=time.perf_counter(), number=None, final=None,
+                  camera=camera_of_address(raw, address) or CAMERA_TABS[tab],
+                  files={p.name for p in stand.PHOTOS.glob(f'{self.imei}_*.jpg')},
+                  seen=board.journal[-1].index if board.journal else -1)
+        uid = self.command(cmd, bytes([address]) if payload is None else payload)
+        if uid is None:
+            return
+        self.notice.set(f'{label} · принято в очередь (№{uid}) — результат в карточке «Последняя команда»')
+        self.pending[tab] = dict(op, uid=uid)
+
+    @staticmethod
+    def finish(op, text, tone):
+        """Итог команды запоминается: дальше его не пересчитываем."""
+        op['final'] = text, tone
+        return op['final']
+
+    def camera_result(self, tab, board):
+        """(текст, тон) по ответу 11, пакету 8, событию 129 и новому файлу снимка."""
+        op = self.pending.get(tab)
+        if not op or op['imei'] != self.imei:
+            return 'С этой вкладки команд ещё не было', ''
+        if op['final']:
+            return op['final']
+        if op['answer'] is None:
+            row = board.queue.latest(op['uid'], op['cmd']) if board.queue else None
+            code = next((answer_code(p, op['cmd']) for t, u, c, p in reversed(board.inbox)
+                         if t >= op['mark'] and u == op['uid'] and c == 11), None)
+            if code is None and row and row['state'] in ('done', 'error'):
+                found = re.search(r'код (\d+)', row['reason'] or '')
+                code = 0 if row['state'] == 'done' else int(found.group(1)) if found else None
+            if code is None:
+                state = row['state'] if row else 'unknown'
+                if state in ('queued', 'sent'):
+                    return op['prefix'] + ('Команда в очереди, ждём плату…' if state == 'queued' else 'Команда отправлена, ждём ответ платы…'), ''
+                return self.finish(op, op['prefix'] + f'Ответа платы нет: {STATES[state].lower()}' +
+                                   (f' — {row["reason"]}' if row and row['reason'] else ''), 'bad')
+            op['answer'], op['answered'] = code, time.time()
+        if op['answer']:
+            return self.finish(op, op['prefix'] + answer_text(op['cmd'], op['answer'], op['camera'], op['address']), 'bad')
+        waited = time.time() - op['answered']
+        if op['cmd'] == 6:
+            reader = board.last_reader
+            if reader and reader[0] >= op['started']:
+                text = reader_text(reader[1], reader[2], op['address'])
+                if reader[1] == 1 and op['shoot']:
+                    op['shoot'] = False   # «Считать номер и снять»: камера отдаёт кадр, пока видела номер последние 5 с
+                    try:
+                        self.camera_command(tab, 'Сделать снимок', 7, op['address'], prefix=text + ' · ')
+                    except ValueError as exc:
+                        return self.finish(op, f'{text} · снимок не отправлен: {exc}', 'bad')
+                    return text + ' · снимаем…', ''
+                return self.finish(op, text, 'good' if reader[1] == 1 else 'bad')
+            if waited > 20:
+                return self.finish(op, 'Номер не пришёл за 20 с — проверьте связь с платой (подробности в «Обмене»)', 'bad')
+            return answer_text(6, 0, op['camera'], op['address']), ''
+        # Свой снимок: номер из события 129 после команды или время съёмки рядом со временем команды.
+        for record in board.journal[-40:]:
+            if record.type == 129 and record.index > op['seen'] and not op['number']:
+                op['number'] = struct.unpack_from('<I', record.arg1)[0]
+        fresh = sorted((s for s in self.shots if s['name'] not in op['files'] and (s['number'] == op['number'] or
+                        op['started'] - SHOT_SLACK <= s['number'] <= op['started'] + SHOT_WAIT + SHOT_SLACK)),
+                       key=lambda s: s['number'] != op['number'])
+        if fresh:
+            return self.finish(op, op['prefix'] + shot_done(fresh[0], op['camera']), 'good')
+        if waited > SHOT_WAIT:
+            if board.busy_photo and waited < 3 * SHOT_WAIT:
+                return op['prefix'] + 'Снимок ещё передаётся, ждём…', ''
+            return self.finish(op, op['prefix'] + shot_failed(op['camera']), 'bad')
+        if op['number']:
+            return op['prefix'] + 'Камера сняла, «Нависет» забирает снимок…', ''
+        return op['prefix'] + answer_text(7, 0, op['camera'], op['address']), ''
 
     def add_plate(self):
-        """Форма ID «Автономер» с последним считанным номером; передача — «Сохранить и синхронизировать»."""
-        reader = self.board().last_reader
-        plate = stand.text10(reader[2]) if reader and reader[1] == 1 else ''
-        self.navigate('Доступ')
-        self.edit_row('ids', preset={'identifier': plate, 'kind': 3})
-
-    def open_photo(self):
+        """Форма ID «Автономер» с самым свежим номером (захват или журнал); передача — «Сохранить и синхронизировать»."""
         board = self.board()
-        files = sorted(stand.PHOTOS.glob(f'{board.imei}_*.jpg'), key=lambda p: p.stat().st_mtime)
-        if not files:
-            raise ValueError('Нет полностью полученных фото')
-        os.startfile(str(files[-1]))
+        with board.lock:
+            found = latest_plate(board.last_reader, board.journal)
+        self.navigate('Доступ')
+        self.edit_row('ids', preset={'identifier': found[1] if found else '', 'kind': 3})
+
+    def open_camera(self):
+        """С главной: камера номеров, если она есть в копии настроек; без копии — камера самого нового снимка."""
+        raw = bytes.fromhex(self.store.get(self.imei).get('settings', '')) if self.imei else b''
+        if table_addresses(raw, PLATE_TYPE) or table_addresses(raw, JPEG_TYPE):
+            plate = bool(table_addresses(raw, PLATE_TYPE))
+        else:
+            plate = next((s['kind'] for s in self.shots if s['kind'] != 'unknown'), None) == 'plate'
+        self.navigate('Камера номеров' if plate else 'JPEG-камера')
+
+    def apply_camera_addresses(self, force=False):
+        """Адреса камер по копии настроек. Адрес, введённый, но не отправленный, при правке ID и групп не затирается;
+        force — после загрузки копии или «Сохранить и отправить настройки»: таблица 485 важнее."""
+        data = self.store.get(self.imei)
+        raw = bytes.fromhex(data.get('settings', ''))
+        for tab, variable, key in (('JPEG-камера', self.jpeg_address, 'jpeg_address'),
+                                   ('Камера номеров', self.plate_address, 'plate_address')):
+            value, note = camera_address(raw, TAB_TYPES[tab], data.get(key))
+            auto = self.auto_address.get(tab)
+            if force or not auto or auto[0] != self.imei or variable.get() == auto[1]:
+                variable.set(value)
+            self.auto_address[tab] = self.imei, value
+            self.address_hints[tab] = note
+        self.address_warnings(raw)
+
+    def address_warnings(self, raw):
+        """Пояснение под полем адреса; если по таблице 485 этот адрес у другой камеры — предупредить."""
+        for tab, variable in (('JPEG-камера', self.jpeg_address), ('Камера номеров', self.plate_address)):
+            text, hint = variable.get().strip(), self.address_hints.get(tab, '')
+            other = camera_of_address(raw, int(text)) if text.isascii() and text.isdecimal() and int(text) < 256 else None
+            if other and other != CAMERA_TABS[tab]:
+                hint = f'Внимание: по таблице 485 адрес {text} — это {CAMERAS[other]}, снимок сделает она'
+            elif hint == FROM_TABLE and text not in map(str, table_addresses(raw, TAB_TYPES[tab])):
+                hint = 'Адрес введён вручную'
+            if self.address_notes[tab]['text'] != hint:
+                self.address_notes[tab].configure(text=hint)
 
     def make_queue(self):
         page = self.pages['Очередь']
@@ -702,10 +893,8 @@ class App:
             return
         data = self.store.get(self.imei)
         raw = bytes.fromhex(data.get('settings', ''))
-        cameras = [raw[179+i*2] for i in range(8) if len(raw) == 512 and raw[180+i*2] in CAMERA_TYPES and raw[179+i*2]]
-        saved = data.get('camera_address', 1)
-        self.camera.set(str(saved if saved in cameras or not cameras else cameras[0]))  # адрес из таблицы 485 важнее старого
-        self.camera_format.set(data.get('camera_format', 'ДОМОВОЙ NEXT'))
+        # Адрес из таблицы 485 важнее сохранённого; старые camera_address/camera_format в данных не трогаем.
+        self.apply_camera_addresses()
         for kind, tree in self.tables.items():
             tree.delete(*tree.get_children())
             for i, row in enumerate(data.get(kind, [])):
@@ -761,15 +950,27 @@ class App:
             online = [imei for imei, board in boards.items() if board.conn]
             self.peers.selection_set(online[0] if online else self.peers.get_children()[0])
 
+    def cause_records(self, board):
+        """События-причины снимков из всей таблицы journal: в памяти платы только последние 1500,
+        а объяснение старого снимка не должно меняться от перезапуска. Вызывать под board.lock."""
+        if not board.queue:
+            return list(board.journal)
+        rows = board.queue.db.execute('SELECT raw FROM journal WHERE imei=?', (self.imei,))
+        return [stand.Record(raw) for raw, in rows if len(raw) > 8 and raw[8] in CAUSES]
+
     def refresh_board(self):
         if not self.imei:
             self.dashboard.refresh(None)
-            self.photo_preview.refresh(None, stand.PHOTOS)
+            for panel in (self.jpeg_shots, self.plate_shots):
+                panel.update_shots([], 'Выберите плату слева')
             return
         board = self.board()
         data = self.store.get(self.imei)
-        self.photo_preview.refresh(self.imei, stand.PHOTOS)
-        self.heading.config(text=f'{data.get("name", self.imei)} · {self.imei} · {data.get("object", "")}')
+        self.heading.config(text=' · '.join(dict.fromkeys(filter(None, (data.get('name'), self.imei, data.get('object'))))))
+        try:
+            stamp = stand.PHOTOS.stat().st_mtime_ns  # новый файл в папке меняет время папки
+        except OSError:
+            stamp = None
         with board.lock:
             status, details, reg = board.status, board.details, board.reg
             if not board.conn:
@@ -800,27 +1001,49 @@ class App:
             if signature != self._event_signature:
                 position = self.events.yview()[0]
                 self.events.delete(*self.events.get_children())
-                for record in board.journal[-150:]:
-                    self.events.insert('', 'end', values=(stand.when(record.time), str(record)))
+                for record in reversed(board.journal[-150:]):
+                    detail = record.arg_text() + (f', проходов {record.passes}' if record.passes != 255 and record.type in PASS_EVENTS else '')
+                    if record.type == 129:
+                        number = struct.unpack_from('<I', record.arg1)[0]
+                        detail = f'снимок {local_when(number)} (№{number})'
+                    self.events.insert('', 'end', values=(local_when(record.time), record.type, stand.EVENTS.get(record.type, '?'), detail))
                 self.events.yview_moveto(position if self._event_signature and self._event_signature[0] == self.imei else 0)
                 self._event_signature = signature
-            self.photo_note.set(f'Получено фотографий: {len(board.completed_photos)} · ' +
-                                ('Принимаем фото…' if board.busy_photo else 'Ожидание следующего снимка'))
+            # Список снимков пересчитывается вне замка и только когда что-то изменилось (раз в 30 с — на всякий случай).
+            sent = tuple(r[0] for r in board.queue.db.execute(
+                "SELECT sent FROM commands WHERE imei=? AND cmd=7 AND state='done' AND sent IS NOT NULL", (self.imei,))) if board.queue else ()
+            shots_key = (self.imei, str(stand.PHOTOS), stamp, len(board.journal), board.journal[-1].index if board.journal else -1,
+                         sent, int(time.time() // 30))
+            causes = self.cause_records(board) if shots_key != self._shots_key else None
+            busy = board.busy_photo
+        if causes is not None:
+            self.shots, self._shots_key = list_shots(stand.PHOTOS, self.imei, causes, sent), shots_key
+        for panel in (self.jpeg_shots, self.plate_shots):
+            panel.update_shots(self.shots)
+            panel.set_busy(busy)
+        copy = bytes.fromhex(data.get('settings', ''))
+        settings = copy if len(copy) == 512 else bytes(512)
+        self.address_warnings(copy)
+        with board.lock:
+            details = board.details
+            for tab, label in (('JPEG-камера', self.jpeg_result), ('Камера номеров', self.plate_result)):
+                text, tone = self.camera_result(tab, board)
+                label.configure(text=text, foreground={'good': '#16734b', 'bad': '#b42318'}.get(tone, '#172b4d'))
             # Ответы устройств 485 — состояние периферии статуса 2; включённые — по сохранённой копии настроек.
             states = bytes.fromhex(details['peripherals']) if details and details.get('peripherals') else b''
-            settings = bytes.fromhex(data.get('settings', ''))
-            settings = settings if len(settings) == 512 else bytes(512)
             for i, (_, _, state) in enumerate(self.peripherals):
                 state.set('—' if not settings[180+i*2] or len(states) < 8 else 'отвечает' if states[i] else 'нет ответа')
-            text = 'Номер с камеры ещё не считывали'
-            if board.last_reader:
-                stamp, code, raw = board.last_reader
-                text = ((f'Считан номер «{stand.text10(raw)}»' if code == 1 else 'Номер не считан: время вышло') +
-                        f' · {dt.datetime.fromtimestamp(stamp):%H:%M:%S}')
-            camera = next((i for i in range(8) if settings[180+i*2] == ANPR_TYPE), None)
-            if camera is not None and len(states) == 8:
-                text += f' · камера номеров, адрес {settings[179+camera*2]}: ' + ('отвечает' if states[camera] else 'нет ответа')
-            self.plate_note.set(text)
+            for tab, label in self.camera_states.items():
+                text = camera_state(details, copy, TAB_TYPES[tab], board.journal)
+                if label['text'] != text:
+                    label.configure(text=text)
+            found = latest_plate(board.last_reader, board.journal)
+            number, note = (found[1], f'{found[2]} · {local_when(int(found[0]))}') if found else ('—', 'Номер ещё не считывали')
+            reader = board.last_reader
+            if reader and reader[1] != 1 and (not found or reader[0] > found[0]):
+                note += f'\nпоследний захват: время вышло · {local_when(int(reader[0]))}'
+            self.plate_number.configure(text=number)
+            self.plate_when.configure(text=note)
             if not board.image:
                 self.firmware_progress.set('Обновление не запускалось для этой платы')
             else:

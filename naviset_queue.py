@@ -213,6 +213,11 @@ class CommandQueue:
             self.db.commit()
             write(candidate['cmd'], bytes(candidate['payload']), candidate['uid'], ttl)
 
+    def latest(self, uid, cmd):
+        """Последняя строка поручения с этим uniq и командой (для строки результата во вкладке)."""
+        return self.db.execute('SELECT * FROM commands WHERE imei=? AND uid=? AND cmd=? ORDER BY id DESC LIMIT 1',
+                               (self.imei, uid, cmd)).fetchone()
+
     def history(self, limit=150):
         return list(self.db.execute('SELECT * FROM commands WHERE imei=? ORDER BY id DESC LIMIT ?',
                                     (self.imei, limit)))[::-1]
